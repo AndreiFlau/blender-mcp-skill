@@ -107,3 +107,17 @@ in the live session unless the user asked.
   This serves the same protocol synchronously (no deferred responses).
 - If the user hasn't installed it: Preferences → Get Extensions → search "MCP"
   (it's a Labs extension) → install + enable, then enable Online Access.
+
+## Live posing and interaction diagnostics
+
+- Find the installed extension's actual module name before inspecting or
+  reloading it: e.g. `bl_ext.user_default.cascadeur_live_posing`, not necessarily
+  `cascadeur_live_posing`. Importing a second copy can inspect an idle module
+  while the installed copy keeps its timers and state. Unregister the active
+  copy and release its callbacks before purging modules.
+- For jerky navigation, modal drags or live-pose latency, read
+  [performance.md](references/performance.md). It includes the verified
+  BlenderKit clipboard-stall case and how to distinguish callback blocking from
+  rig evaluation cost.
+- For transferring poses onto existing rigs, recording them and preserving
+  native controls, read [live-rigging.md](references/live-rigging.md).
