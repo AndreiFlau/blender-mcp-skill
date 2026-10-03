@@ -57,3 +57,21 @@ old object pointers and pause preview so incoming data cannot erase the undo.
 For the current project's exact button behavior, read its
 `docs/character-contacts.md` and `cascadeur_live_posing/actions.py`; avoid assuming
 that a button labelled “Key All” includes unmapped hair, face or other objects.
+
+
+## Reconnection and portable animation proof
+
+A connected replacement socket does not imply fresh pose data. Clear freshness on
+disconnect; resume only after a new validated packet while preserving each rig's
+paused/enabled intent. A regression should connect an empty replacement socket,
+change a correction so stale application is observable, tick, and verify authored
+and evaluated poses remain unchanged. Then send fresh data and check intended
+resumption. See Cascadeur Live Link v0.3.3 `tests/multi_character_reliability.py`.
+
+Prove addon-independent animation in a separate factory-startup Blender process
+with auto-execution disabled, not just by unregistering the producer. A bpy/stdlib
+verifier should assert addon modules/RNA absent, action keys, owner/slot assignments
+and evaluated world matrices at recorded frames. The five-rig/two-pose fixture
+tested OBJECT and ARMATURE slots; its ~2.5e-6 maximum matrix delta is a fixture
+measurement, not a universal tolerance. See `tests/verify_keyed_pose.py` and the
+headless QA skill's production-fixtures reference.

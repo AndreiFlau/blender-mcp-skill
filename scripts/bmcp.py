@@ -15,6 +15,8 @@ The code runs on Blender's main thread in a fresh namespace. Assign a dict to a
 variable named `result` to return structured data; print() output is captured
 into "stdout". Exceptions come back as status "error" with the traceback.
 """
+import argparse
+import math
 import json
 import os
 import socket
@@ -57,22 +59,22 @@ def show(resp):
         sys.exit(1)
 
 
-def main():
-    args = sys.argv[1:]
-    timeout = 120
-    if args and args[0] == "-t":
-        timeout = float(args[1])
-        args = args[2:]
-    if args and args[0] == "-f":
-        with open(args[1], encoding="utf-8") as f:
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("code", nargs="?", help="Python code to execute")
+    source.add_argument("-f", "--file", help="UTF-8 Python script to execute")
+    parser.add_argument("-t", "--timeout", type=float, default=120,
+                        help="response timeout in seconds (default: 120)")
+    args = parser.parse_args(argv)
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("timeout must be a positive finite number")
+    if args.file:
+        with open(args.file, encoding="utf-8") as f:
             code = f.read()
-    elif args:
-        code = args[0]
     else:
-        print(__doc__)
-        sys.exit(2)
-    code = "import bpy\n" + code
-    show(execute(code, timeout=timeout))
+        code = args.code
+    show(execute("import bpy\n" + code, timeout=args.timeout))
 
 
 if __name__ == "__main__":

@@ -74,3 +74,30 @@ evaluate meshes. In this bridge, a temporary rig-only view layer for intermediat
 solves plus one final visible evaluation reduced cost without changing modifiers.
 This needs explicit dependency coverage and cleanup on disconnect, save, undo,
 reload and unregister; it is not a generic instruction to hide meshes.
+
+
+## Node links and honest timing scopes
+
+`NodeSocket.links` can scan the whole tree. For traversal, build incoming-link and
+parent maps once per tree; for unused-output checks, first test `output.is_linked`
+and enumerate only linked outputs. Preserve conservative treatment of physical
+wires, including muted/custom branches. Do not retain compatibility decisions
+across graph edits. Avoid writing unchanged socket values and stop traversal at
+an existing managed layer when the graph contract permits it.
+
+Futafy 0.5.16 measured 351.87 → 10.51 ms for the same prepared color callback
+(`tests/test_color_performance.py`); Fluid Painter 0.9.6 measured roughly
+9.0 → 0.28 ms for six-graph compatibility classification, with much smaller
+whole-scene gains (`tests/test_surface_cache_links.py`, `docs/refinement_validation.md`).
+Neither is viewport FPS. The first `is_linked` query after a topology edit need not
+be free. See [render-and-cache-safety.md](render-and-cache-safety.md) for demand and
+invalidation requirements before adding a cache.
+
+Alternate warmed native/candidate/native trials and separate setup from edits.
+An apparently faster shader became 18.964/18.969 seconds in interleaved trials;
+it was withheld. A contour change failed tiny/degenerate cases despite a warmed
+gain; it was also withheld. Validate topology, materials and named attributes,
+not coordinates alone. `Modifier.execution_time` can retain a prior evaluation
+for unchanged objects: summing every object's last value is not the current update
+cost. A 52.8% preparation reduction was only about 0.52% of total render time.
+These are Fluid Painter fixture measurements, not expected gains for other scenes.

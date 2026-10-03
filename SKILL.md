@@ -7,7 +7,7 @@ description: Execute Python inside a live Blender session via the official Blend
 
 Talk to a **running Blender session** by executing Python on its main thread. The
 bridge is the official "MCP" extension from extensions.blender.org (Labs), package
-id `lab_blender_org/mcp`. No MCP server registration in Claude Code is needed —
+id `lab_blender_org/mcp`. No MCP server registration in Codex is needed —
 speak to the extension's TCP socket directly with the bundled client.
 
 **This is NOT the community `ahujasid/blender-mcp` protocol.** Requests there use
@@ -29,6 +29,13 @@ Host/port override via env vars `BLENDER_MCP_HOST` / `BLENDER_MCP_PORT` (default
 First call after idle can lag ~1 s (the server polls its socket on a Blender timer
 that backs off to a 1 s interval when idle); subsequent calls are fast (0.05–0.25 s
 active tick).
+
+Before mutation, read the recipient's PID, filepath, scene and expected object,
+then assert that identity inside the mutating script. Multiple GUI instances can
+share a nominal port setup. Coordinate live-app/render ownership with other agents;
+see [sessions-and-reload.md](references/sessions-and-reload.md).
+
+`python <this-skill-dir>/scripts/bmcp.py --help` is local-only; it never connects.
 
 ## Protocol (if writing your own client)
 
@@ -63,16 +70,12 @@ Null-byte-delimited JSON over TCP:
 ## Addon development loop
 
 1. **Inspect first**: scene/object/material state via `result = {...}` queries.
-2. **Load the addon from the repo** (no reinstall per edit):
-   ```python
-   import sys, importlib
-   sys.path.insert(0, r"<repo dir containing the addon package>")
-   import myaddon
-   importlib.reload(myaddon)   # plus reload submodules, or bump a loader script
-   myaddon.register()
-   ```
-   For a full clean reload of a multi-file addon, purge `sys.modules` entries
-   first: `[sys.modules.pop(k) for k in list(sys.modules) if k.startswith("myaddon")]`.
+2. **Reload the active package safely**: identify the installed namespace and
+   source path; snapshot user state, unregister the active module, then purge only
+   that exact namespace and its children before importing/registering tested code.
+   Follow [sessions-and-reload.md](references/sessions-and-reload.md), including
+   stale test-package aliases and callback identity checks. Do not blindly call
+   `register()` on an already registered or second short-name copy.
 3. **Exercise operators** (`bpy.ops.myaddon.thing()`), then re-inspect state.
 4. **Verify visually**: render to a file, then view it with the Read tool:
    ```python
@@ -121,3 +124,12 @@ in the live session unless the user asked.
   rig evaluation cost.
 - For transferring poses onto existing rigs, recording them and preserving
   native controls, read [live-rigging.md](references/live-rigging.md).
+
+## Focused workflows
+
+- Paint canvas, shader layers, dirty image packing and UV/API traps:
+  [painting-and-materials.md](references/painting-and-materials.md).
+- Native render thread boundaries, ID retirement, demand-driven caches and 5.2
+  Geometry Nodes inputs: [render-and-cache-safety.md](references/render-and-cache-safety.md).
+- Production render comparisons, evaluated snapshots and fresh-process save/reload
+  proof: use the **blender-headless-qa** skill and its production-fixtures reference.
