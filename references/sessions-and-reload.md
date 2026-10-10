@@ -41,6 +41,41 @@ path/version and exactly one observer registration. Retest after returning throu
 the event loop. Tests with all rigs paused do not establish safe reload during a
 live drag or active stream.
 
+## Swap an installed extension in a session that must not restart
+
+`blender --command extension install-file -r user_default --enable <zip>`, run from
+another process, replaces the files and nothing else: an open Blender keeps the
+modules it imported, and unticking and ticking the add-on reloads only its
+`__init__` when the package imports lazily. To make the open session run the new
+code, inside that Blender:
+
+1. Find the name in `bpy.context.preferences.addons` whose last part is the id.
+   Refuse while the add-on has work in progress (a running job, a pending timer).
+2. Compile every `.py` of the installed folder in memory first
+   (`compile(path.read_text(), str(path), 'exec')`), so a broken update cannot
+   leave the session with no add-on. `py_compile.compile` writes a `.pyc` and
+   failed on a missing `__pycache__`.
+3. Snapshot the scene settings and `preferences.is_dirty`.
+4. `addon_utils.disable(name, default_set=False)`, delete exactly `name` and its
+   `name + '.'` children from `sys.modules`, `importlib.invalidate_caches()`,
+   `addon_utils.enable(name, default_set=False)`. `default_set=False` leaves the
+   saved preferences alone.
+5. Put back any setting that changed, restart the add-on's own timers, restore
+   `is_dirty`, tag the areas for redraw, and report the version now running.
+
+Scene `PropertyGroup` values and the add-on's preferences came through by
+themselves; settings the old version did not have appeared at their defaults; the
+preferences were not marked for saving.
+
+When the bridge answers from a different Blender than the one meant (two
+instances on one port) and rebinding is not yours to do, hand the user one line
+for that Blender's Python Console instead:
+`exec(open(r"<path to the reload script>", encoding="utf8").read())`.
+
+Evidence: Resolve Bridge v0.5.3, commit 441c103, `tools/reload_in_blender.py` and
+`.work/test_reload.py` (0.5.0 and 0.5.1 running, 0.5.3 installed from another
+process, in a sandboxed profile). Not exercised through the live bridge.
+
 Evidence: Cascadeur Live Link v0.3.3, commit 8a15433, `.work/install_033_validation.py`
 and `tests/multi_character_reliability.py`; Fluid Painter Evolved v0.9.6,
 commit 752ea13, installed-release verification and `local/admin/refine_install_live.py`;
