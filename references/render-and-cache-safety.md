@@ -60,3 +60,51 @@ and `properties.outputs.<identifier>.attribute_name` for named outputs. Retain a
 version/capability-gated older ID-property path. Validate undo/redo as separate UI
 events, use an ordinary custom property as control, and reacquire IDs after undo.
 See `FP_Utilities.py`, `docs/interaction_validation.md`, `tests/live_surface_patch.py`.
+
+## A view layer of your own, and Blender's compositor preview (5.2, read in its source)
+
+Paid for on 2026-10-13 with a crash in the user's face. An add-on kept a hidden
+view layer in the user's scene to evaluate rigs cheaply, and removed it when it
+was done.
+
+- After ANY evaluation of ANY view layer of a scene on the main thread
+  (`ViewLayer.update()`, `scene.frame_set()`, which evaluates every layer of the
+  scene in list order), Blender calls `update_compositor`
+  (`editors/render/render_update.cc`). If the scene has a compositor tree whose
+  output is tagged (a frame change on an animated tree, a first evaluation, a
+  node edit) and an editor shows its result (a node editor backdrop, an Image
+  Editor on the Viewer or the Render Result), it starts a compositor job FOR
+  THAT LAYER. The job stores the `ViewLayer*`
+  (`editors/space_node/node_compositor_job.cc`).
+- While a compositor job runs, the next is queued (`WM_jobs_start`) and its
+  `compositor_job_init` reads the pointer when the running one ends. A job that
+  may not run beside a render or a bake waits for that
+  (`wm_jobs_test_suspend_stop`, every job with `WM_JOB_EXCL_RENDER`).
+- `scene.view_layers.remove(layer)` in between is a use after free:
+  `EXCEPTION_ACCESS_VIOLATION` in `layer_collection_sync` under
+  `BKE_view_layer_synced_ensure` under `compositor_job_init`. Blender alone does
+  it: `scene.frame_set(n); scene.view_layers.remove(extra)` in one script turn,
+  animated compositor tree, backdrop on.
+- Safe moments to free a view layer: before and after undo/redo (Blender calls
+  `WM_jobs_kill_all` in `ed_undo_step_pre`, before the `undo_pre` handlers) and
+  on file load. NOT on `save_pre`, nor at any moment of your own choosing.
+  Elsewhere, free it only when
+  `not any(bpy.app.is_job_running(k) for k in ('COMPOSITE', 'RENDER', 'RENDER_PREVIEW', 'OBJECT_BAKE'))`,
+  and otherwise leave it and retry from a timer.
+
+## A crash that comes "sometimes" is often a use after free: make it come always
+
+Freed memory still reads fine until something else is put there, so the same
+bug survived 10 runs of 13. `blender --debug-memory` fills freed memory with
+255 and the bug died every time, which turned guessing into a control (the old
+code dies) and a proof (the new code lives). Run both.
+
+A windowed Blender that crashes shows a "restart or close" window and waits for
+a click, so a script that runs it hangs and the user gets a pile of dialogs.
+Watch for `<TEMP>/<blend name or "blender">.crash.txt` and kill the process by
+a marker in its own command line as soon as that file appears.
+
+Blender's source for the exact version is one `curl` away:
+`https://projects.blender.org/blender/blender/raw/branch/blender-v5.2-release/source/blender/<path>`.
+Read it before theorising: an hour of guesses about which pointer was stale
+ended in ten minutes of reading.
