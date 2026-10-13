@@ -85,12 +85,34 @@ was done.
   `BKE_view_layer_synced_ensure` under `compositor_job_init`. Blender alone does
   it: `scene.frame_set(n); scene.view_layers.remove(extra)` in one script turn,
   animated compositor tree, backdrop on.
-- Safe moments to free a view layer: before and after undo/redo (Blender calls
-  `WM_jobs_kill_all` in `ed_undo_step_pre`, before the `undo_pre` handlers) and
-  on file load. NOT on `save_pre`, nor at any moment of your own choosing.
-  Elsewhere, free it only when
-  `not any(bpy.app.is_job_running(k) for k in ('COMPOSITE', 'RENDER', 'RENDER_PREVIEW', 'OBJECT_BAKE'))`,
-  and otherwise leave it and retry from a timer.
+- **Whether such a job waits cannot be asked from Python.**
+  `bpy.app.is_job_running` is `WM_jobs_has_running_type`: it knows jobs that
+  RUN. A compositor preview suspended behind a render, a bake or a preview
+  render has `running` false and holds the pointer, it starts up to 0.1 s after
+  what it waited for ends (Python timers run in that gap), and light bakes and
+  multires bakes cannot be asked about at all. A first mend that asked
+  ("free when nothing runs, else retry from a timer") was killed four ways by
+  an independent reviewer; do not write that mend again.
+- The only moments a view layer of your own may be freed: in a handler of
+  `undo_pre`/`redo_pre`/`undo_post`/`redo_post` and `load_post` (Blender calls
+  `WM_jobs_kill_all` in `ed_undo_step_pre` and in
+  `wm_file_read_setup_wm_init` first), and even there only if none of
+  COMPOSITE, RENDER, RENDER_PREVIEW, OBJECT_BAKE runs: another add-on's handler
+  ahead of yours can start a preview render and set the frame, and then a
+  compositor preview waits for your layer again. NOT on `save_pre`, not at the
+  end of your own job, not from a timer. In background mode
+  (`bpy.app.background`) no compositor preview exists and freeing is safe.
+- While the user works, leave the layer in the scene. Do NOT reuse a layer you
+  stopped using for a new evaluation: measured, a rig followed in a layer that
+  was left and taken up again came out 4.6 cm and 13 degrees from the same
+  follow in a new layer (the take's keys are played over what was just
+  written). Make a new one beside it and free both at the next undo or load.
+- A view layer with `use = False` is Blender's "default view layer"
+  (`BKE_view_layer_default_view`: the first one not used for rendering): when
+  the user deletes the layer a window shows, the window lands on yours. Put the
+  window back on one of the scene's own.
+- Have an independent reviewer attack a crash mend with the same instrument
+  before believing it. Twice the mend "passed everything" and twice it died.
 
 ## A crash that comes "sometimes" is often a use after free: make it come always
 
