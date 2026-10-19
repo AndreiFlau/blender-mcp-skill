@@ -2,7 +2,7 @@
 
 A [Claude Code](https://claude.com/claude-code) skill that lets Claude execute
 Python inside a **running Blender session** through the official
-[Blender MCP extension](https://extensions.blender.org/) (Blender Labs,
+[Blender MCP extension](https://projects.blender.org/lab/blender_mcp) (Blender Lab,
 package `lab_blender_org/mcp`) — no MCP server registration required, the
 skill talks to the extension's TCP bridge directly.
 
@@ -22,8 +22,9 @@ git clone https://github.com/AndreiFlau/blender-mcp-skill "%USERPROFILE%\.claude
 
 ## Requirements
 
-- Blender 5.x with the official **MCP** extension (Preferences → Get
-  Extensions → search "MCP", a Blender Labs extension) enabled, plus
+- Blender 5.x with the official **MCP** extension, version 1.0.3 or later
+  (Preferences → Get Extensions → search "MCP"; it is in the `lab.blender.org`
+  repository, not extensions.blender.org) enabled, plus
   **Allow Online Access** in Preferences → System.
 - The extension auto-starts its bridge server on `localhost:9876`.
 

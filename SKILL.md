@@ -6,9 +6,23 @@ description: Execute Python inside a live Blender session via the official Blend
 # Blender MCP bridge (official Blender Labs extension)
 
 Talk to a **running Blender session** by executing Python on its main thread. The
-bridge is the official "MCP" extension from extensions.blender.org (Labs), package
-id `lab_blender_org/mcp`. No MCP server registration in Codex is needed —
-speak to the extension's TCP socket directly with the bundled client.
+bridge is the official "MCP" extension by Blender Lab, source
+<https://projects.blender.org/lab/blender_mcp>, installed from Blender's
+`lab.blender.org` extension repository (not extensions.blender.org), package id
+`lab_blender_org/mcp`. No MCP server registration in Codex is needed —
+speak to the extension's TCP socket directly with the bundled client. (Each
+release also ships a `.mcpb` MCP-server bundle for chat apps; this skill does not
+use it.)
+
+**Keep it at 1.0.3 or later.** 1.0.0 to 1.0.2 send replies with a non-blocking
+`sendall`, so a large reply (a Hi-DPI screenshot, a big `result` dict) can arrive
+cut short and fail as truncated JSON ("Unterminated string"); 1.0.3 queues the
+rest. The `lab.blender.org` repo has "sync on startup" off, so Blender only
+learns of a new version when its listing is refreshed (Preferences → Get
+Extensions shows an Update button once it is): check there, or read
+`extensions/lab_blender_org/.blender_ext/index.json` against the installed
+`blender_manifest.toml`. Updating reloads the add-on and drops the socket: never
+update it from inside a bmcp request.
 
 **This is NOT the community `ahujasid/blender-mcp` protocol.** Requests there use
 `{"type": "get_scene_info"|"execute_code", "params": {...}}` with no terminator;
@@ -109,7 +123,8 @@ in the live session unless the user asked.
   ```
   This serves the same protocol synchronously (no deferred responses).
 - If the user hasn't installed it: Preferences → Get Extensions → search "MCP"
-  (it's a Labs extension) → install + enable, then enable Online Access.
+  (it's in the `lab.blender.org` repository, which has to be added first if it is
+  not listed) → install + enable, then enable Online Access.
 
 ## Live posing and interaction diagnostics
 
