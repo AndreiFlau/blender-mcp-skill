@@ -1,0 +1,12 @@
+{
+ "glb": {
+  "expires": 300,
+  "size": 4440,
+  "url": "{BASE}/files/fx_crate.glb"
+ },
+ "gltf": {
+  "expires": 300,
+  "size": 1992,
+  "url": "{BASE}/files/sf_box.zip"
+ }
+}

@@ -1,0 +1,104 @@
+{
+ "fx_badmd5": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "date_published": 1700000000,
+  "download_count": 3,
+  "max_resolution": [
+   1024,
+   512
+  ],
+  "name": "Bad Sky",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 0
+ },
+ "fx_cut": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "date_published": 1700000000,
+  "download_count": 5,
+  "max_resolution": [
+   1024,
+   512
+  ],
+  "name": "Cut Sky",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 0
+ },
+ "fx_short": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "date_published": 1700000000,
+  "download_count": 4,
+  "max_resolution": [
+   1024,
+   512
+  ],
+  "name": "Short Sky",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 0
+ },
+ "fx_sky": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "category": "Skies",
+  "date_published": 1700000000,
+  "download_count": 900,
+  "max_resolution": [
+   1024,
+   512
+  ],
+  "name": "Fixture Sky",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 0
+ },
+ "fx_sky2": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "category": "Skies",
+  "date_published": 1700000000,
+  "download_count": 100,
+  "max_resolution": [
+   1024,
+   512
+  ],
+  "name": "Fixture Sky Two",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 0
+ }
+}

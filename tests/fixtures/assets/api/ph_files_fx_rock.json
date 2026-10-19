@@ -1,0 +1,85 @@
+{
+ "AO": {
+  "1k": {
+   "jpg": {
+    "md5": "83354bd8cedb06017d3c4243aeba4c35",
+    "size": 700,
+    "url": "{BASE}/files/fx_rock_ao_1k.jpg"
+   }
+  }
+ },
+ "Diffuse": {
+  "1k": {
+   "jpg": {
+    "md5": "e8bcdd5c39b820fb156bc90b0ab4d372",
+    "size": 723,
+    "url": "{BASE}/files/fx_rock_diff_1k.jpg"
+   }
+  }
+ },
+ "Displacement": {
+  "1k": {
+   "jpg": {
+    "md5": "49d254c5eadc735ef058e3a593fab439",
+    "size": 721,
+    "url": "{BASE}/files/fx_rock_disp_1k.jpg"
+   }
+  }
+ },
+ "Rough": {
+  "1k": {
+   "jpg": {
+    "md5": "2c8cfff3183c744b9e5c20c85aa66c5b",
+    "size": 721,
+    "url": "{BASE}/files/fx_rock_rough_1k.jpg"
+   }
+  }
+ },
+ "arm": {
+  "1k": {
+   "jpg": {
+    "md5": "66e77c60a5660b8343a3a0d26c73fe3b",
+    "size": 734,
+    "url": "{BASE}/files/fx_rock_arm_1k.jpg"
+   }
+  }
+ },
+ "gltf": {
+  "1k": {
+   "gltf": {
+    "include": {},
+    "md5": "00000000000000000000000000000000",
+    "size": 1,
+    "url": "{BASE}/files/never_fetched.gltf"
+   }
+  }
+ },
+ "mtlx": {
+  "1k": {
+   "mtlx": {
+    "include": {},
+    "md5": "97b999701be0271ec9d3fce7df98727f",
+    "size": 836,
+    "url": "{BASE}/files/fx_rock_1k.mtlx"
+   }
+  }
+ },
+ "nor_dx": {
+  "1k": {
+   "jpg": {
+    "md5": "c6310ffaee91f22f966d6f73d0331d23",
+    "size": 738,
+    "url": "{BASE}/files/fx_rock_nor_dx_1k.jpg"
+   }
+  }
+ },
+ "nor_gl": {
+  "1k": {
+   "jpg": {
+    "md5": "c6310ffaee91f22f966d6f73d0331d23",
+    "size": 738,
+    "url": "{BASE}/files/fx_rock_nor_gl_1k.jpg"
+   }
+  }
+ }
+}

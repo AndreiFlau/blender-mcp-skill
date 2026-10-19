@@ -1,0 +1,116 @@
+{
+ "cursors": {
+  "next": null,
+  "previous": null
+ },
+ "next": null,
+ "previous": null,
+ "results": [
+  {
+   "archives": {
+    "glb": {
+     "size": 900,
+     "type": "glb"
+    },
+    "gltf": {
+     "size": 1000,
+     "type": "gltf"
+    }
+   },
+   "categories": [
+    {
+     "name": "furniture-home"
+    }
+   ],
+   "faceCount": 24,
+   "isDownloadable": true,
+   "license": {
+    "label": "CC Attribution",
+    "requirements": "Author must be credited. Commercial use is allowed.",
+    "slug": "by",
+    "url": "http://creativecommons.org/licenses/by/4.0/"
+   },
+   "name": "Fixture Zip Box",
+   "tags": [
+    {
+     "name": "box",
+     "slug": "box"
+    }
+   ],
+   "thumbnails": {
+    "images": [
+     {
+      "height": 405,
+      "url": "{BASE}/files/thumbs/thumb.png",
+      "width": 720
+     },
+     {
+      "height": 112,
+      "url": "{BASE}/files/thumbs/thumb.png",
+      "width": 200
+     }
+    ]
+   },
+   "uid": "sfboxok0000000000000000000000001",
+   "user": {
+    "displayName": "Fixture Artist",
+    "username": "fixture_artist"
+   },
+   "vertexCount": 16,
+   "viewerUrl": "https://sketchfab.com/3d-models/fixture-sfboxok0000000000000000000000001"
+  },
+  {
+   "archives": {
+    "glb": {
+     "size": 900,
+     "type": "glb"
+    },
+    "gltf": {
+     "size": 1000,
+     "type": "gltf"
+    }
+   },
+   "categories": [
+    {
+     "name": "furniture-home"
+    }
+   ],
+   "faceCount": 24,
+   "isDownloadable": true,
+   "license": {
+    "label": "CC Attribution",
+    "requirements": "Author must be credited. Commercial use is allowed.",
+    "slug": "by",
+    "url": "http://creativecommons.org/licenses/by/4.0/"
+   },
+   "name": "Slip Zip",
+   "tags": [
+    {
+     "name": "box",
+     "slug": "box"
+    }
+   ],
+   "thumbnails": {
+    "images": [
+     {
+      "height": 405,
+      "url": "{BASE}/files/thumbs/thumb.png",
+      "width": 720
+     },
+     {
+      "height": 112,
+      "url": "{BASE}/files/thumbs/thumb.png",
+      "width": 200
+     }
+    ]
+   },
+   "uid": "sfslip00000000000000000000000002",
+   "user": {
+    "displayName": "Fixture Artist",
+    "username": "fixture_artist"
+   },
+   "vertexCount": 16,
+   "viewerUrl": "https://sketchfab.com/3d-models/fixture-sfslip00000000000000000000000002"
+  }
+ ]
+}

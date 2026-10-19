@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<materialx version="1.38">
+  <nodegraph name="NG_fx_rock">
+    <image name="diff" type="color3"><input name="file" type="filename" value="textures/fx_rock_diff_1k.jpg" /></image>
+    <image name="rough" type="float"><input name="file" type="filename" value="textures/fx_rock_rough_1k.exr" /></image>
+    <image name="normal" type="vector3"><input name="file" type="filename" value="textures/fx_rock_nor_gl_1k.exr" /></image>
+    <image name="disp" type="float"><input name="file" type="filename" value="textures/fx_rock_disp_1k.png" /></image>
+  </nodegraph>
+  <displacement name="Displacement" type="displacementshader">
+    <input name="displacement" type="float" output="output_disp_out" nodegraph="NG_fx_rock" />
+    <input name="scale" type="float" value="0.02" />
+  </displacement>
+</materialx>

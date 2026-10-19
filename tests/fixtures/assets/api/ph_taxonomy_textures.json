@@ -1,0 +1,21 @@
+{
+ "categories": [
+  {
+   "children": [
+    {
+     "children": [],
+     "name": "Walls",
+     "path": "Stone/Walls"
+    }
+   ],
+   "name": "Stone",
+   "path": "Stone"
+  },
+  {
+   "children": [],
+   "name": "Metal",
+   "path": "Metal"
+  }
+ ],
+ "type": "textures"
+}

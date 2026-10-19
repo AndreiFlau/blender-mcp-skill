@@ -1,0 +1,28 @@
+{
+ "gltf": {
+  "1k": {
+   "gltf": {
+    "include": {
+     "../../escape.bin": {
+      "md5": "67066da9867f4ffa1fcae02a4cec74ac",
+      "size": 1608,
+      "url": "{BASE}/files/fx_box/fx_box_1k.bin"
+     },
+     "fx_box_1k.bin": {
+      "md5": "67066da9867f4ffa1fcae02a4cec74ac",
+      "size": 1608,
+      "url": "{BASE}/files/fx_box/fx_box_1k.bin"
+     },
+     "textures/fx_box_diff_1k.jpg": {
+      "md5": "6966bd4e9517f76757de5de75380401c",
+      "size": 724,
+      "url": "{BASE}/files/fx_box/textures/fx_box_diff_1k.jpg"
+     }
+    },
+    "md5": "6a88a4e12cba8036b86240c9756ee12a",
+    "size": 2884,
+    "url": "{BASE}/files/fx_box/fx_box_1k.gltf"
+   }
+  }
+ }
+}

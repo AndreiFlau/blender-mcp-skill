@@ -1,0 +1,21 @@
+{
+ "authors": {
+  "Fixture Author": "All"
+ },
+ "categories": [
+  "fixture"
+ ],
+ "category": "Skies",
+ "date_published": 1700000000,
+ "download_count": 900,
+ "max_resolution": [
+  1024,
+  512
+ ],
+ "name": "Fixture Sky",
+ "tags": [
+  "fixture"
+ ],
+ "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+ "type": 0
+}

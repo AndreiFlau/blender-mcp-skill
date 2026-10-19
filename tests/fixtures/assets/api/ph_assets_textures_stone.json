@@ -1,0 +1,27 @@
+{
+ "fx_rock": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "category": "Stone/Walls",
+  "date_published": 1700000000,
+  "dimensions": [
+   1800,
+   1800
+  ],
+  "download_count": 500,
+  "max_resolution": [
+   1024,
+   1024
+  ],
+  "name": "Fixture Rock",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 1
+ }
+}

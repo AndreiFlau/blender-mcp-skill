@@ -1,0 +1,79 @@
+{
+ "fx_box": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "category": "Props",
+  "date_published": 1700000000,
+  "dimensions": [
+   200.0,
+   300.0,
+   600.0
+  ],
+  "download_count": 300,
+  "max_resolution": [
+   1024,
+   1024
+  ],
+  "name": "Fixture Box",
+  "polycount": 24,
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 2
+ },
+ "fx_boxblend": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "date_published": 1700000000,
+  "dimensions": [
+   200.0,
+   300.0,
+   600.0
+  ],
+  "download_count": 2,
+  "max_resolution": [
+   1024,
+   1024
+  ],
+  "name": "Fixture Blend Box",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 2
+ },
+ "fx_slip": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "date_published": 1700000000,
+  "dimensions": [
+   200.0,
+   300.0,
+   600.0
+  ],
+  "download_count": 1,
+  "max_resolution": [
+   1024,
+   1024
+  ],
+  "name": "Slipping Box",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 2
+ }
+}

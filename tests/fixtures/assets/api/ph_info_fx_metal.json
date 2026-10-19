@@ -1,0 +1,25 @@
+{
+ "authors": {
+  "Fixture Author": "All"
+ },
+ "categories": [
+  "fixture"
+ ],
+ "category": "Metal",
+ "date_published": 1700000000,
+ "dimensions": [
+  1000,
+  500
+ ],
+ "download_count": 50,
+ "max_resolution": [
+  1024,
+  1024
+ ],
+ "name": "Fixture Metal",
+ "tags": [
+  "fixture"
+ ],
+ "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+ "type": 1
+}

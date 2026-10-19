@@ -1,0 +1,33 @@
+{
+ "blend": {
+  "1k": {
+   "blend": {
+    "include": {},
+    "md5": "d35982b11bb10a8037675029c3a49fd4",
+    "size": 120000,
+    "url": "{BASE}/files/fx_boxblend_1k.blend"
+   }
+  }
+ },
+ "gltf": {
+  "1k": {
+   "gltf": {
+    "include": {
+     "fx_box_1k.bin": {
+      "md5": "67066da9867f4ffa1fcae02a4cec74ac",
+      "size": 1608,
+      "url": "{BASE}/files/fx_box/fx_box_1k.bin"
+     },
+     "textures/fx_box_diff_1k.jpg": {
+      "md5": "6966bd4e9517f76757de5de75380401c",
+      "size": 724,
+      "url": "{BASE}/files/fx_box/textures/fx_box_diff_1k.jpg"
+     }
+    },
+    "md5": "6a88a4e12cba8036b86240c9756ee12a",
+    "size": 2884,
+    "url": "{BASE}/files/fx_box/fx_box_1k.gltf"
+   }
+  }
+ }
+}

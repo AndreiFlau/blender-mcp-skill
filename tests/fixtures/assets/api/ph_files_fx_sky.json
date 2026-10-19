@@ -1,0 +1,16 @@
+{
+ "hdri": {
+  "1k": {
+   "hdr": {
+    "md5": "c7e87ddf750032c532a57b3c711fb202",
+    "size": 109,
+    "url": "{BASE}/files/fx_sky_1k.hdr"
+   }
+  }
+ },
+ "tonemapped": {
+  "md5": "95c669edfa5e15a762b3f1d97488cd15",
+  "size": 279,
+  "url": "{BASE}/files/thumbs/thumb.png"
+ }
+}

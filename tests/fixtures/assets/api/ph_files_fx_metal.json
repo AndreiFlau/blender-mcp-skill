@@ -1,0 +1,38 @@
+{
+ "Metal": {
+  "1k": {
+   "jpg": {
+    "md5": "cee93de4590f1aca7b8ee17e9ec452c1",
+    "size": 645,
+    "url": "{BASE}/files/fx_metal_metal_1k.jpg"
+   }
+  }
+ },
+ "arm": {
+  "1k": {
+   "jpg": {
+    "md5": "1118eb6d4b7c480417c9f511390ea0d8",
+    "size": 735,
+    "url": "{BASE}/files/fx_metal_arm_1k.jpg"
+   }
+  }
+ },
+ "col_1": {
+  "1k": {
+   "jpg": {
+    "md5": "a286554bccab84efabe35a3e5a99c952",
+    "size": 722,
+    "url": "{BASE}/files/fx_metal_col_1_1k.jpg"
+   }
+  }
+ },
+ "nor_dx": {
+  "1k": {
+   "jpg": {
+    "md5": "c6310ffaee91f22f966d6f73d0331d23",
+    "size": 738,
+    "url": "{BASE}/files/fx_metal_nor_dx_1k.jpg"
+   }
+  }
+ }
+}

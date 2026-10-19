@@ -1,0 +1,22 @@
+{
+ "results": [
+  {
+   "Animated": false,
+   "Attribution": "\"Fixture Crate\" by Fixture Maker, https://poly.pizza/m/PPfxCrate. Licence CC-BY 3.0",
+   "Category": "Objects",
+   "Creator": {
+    "Username": "Fixture Maker"
+   },
+   "Download": "{BASE}/files/fx_crate.glb",
+   "ID": "PPfxCrate",
+   "Licence": "CC-BY 3.0",
+   "Tags": [
+    "box"
+   ],
+   "Thumbnail": "{BASE}/files/thumbs/thumb.png",
+   "Title": "Fixture Crate",
+   "Tri Count": 24
+  }
+ ],
+ "total": 1
+}

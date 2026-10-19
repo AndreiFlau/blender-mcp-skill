@@ -1,0 +1,231 @@
+{
+ "fx_badmd5": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "date_published": 1700000000,
+  "download_count": 3,
+  "max_resolution": [
+   1024,
+   512
+  ],
+  "name": "Bad Sky",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 0
+ },
+ "fx_box": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "category": "Props",
+  "date_published": 1700000000,
+  "dimensions": [
+   200.0,
+   300.0,
+   600.0
+  ],
+  "download_count": 300,
+  "max_resolution": [
+   1024,
+   1024
+  ],
+  "name": "Fixture Box",
+  "polycount": 24,
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 2
+ },
+ "fx_boxblend": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "date_published": 1700000000,
+  "dimensions": [
+   200.0,
+   300.0,
+   600.0
+  ],
+  "download_count": 2,
+  "max_resolution": [
+   1024,
+   1024
+  ],
+  "name": "Fixture Blend Box",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 2
+ },
+ "fx_cut": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "date_published": 1700000000,
+  "download_count": 5,
+  "max_resolution": [
+   1024,
+   512
+  ],
+  "name": "Cut Sky",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 0
+ },
+ "fx_metal": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "category": "Metal",
+  "date_published": 1700000000,
+  "dimensions": [
+   1000,
+   500
+  ],
+  "download_count": 50,
+  "max_resolution": [
+   1024,
+   1024
+  ],
+  "name": "Fixture Metal",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 1
+ },
+ "fx_rock": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "category": "Stone/Walls",
+  "date_published": 1700000000,
+  "dimensions": [
+   1800,
+   1800
+  ],
+  "download_count": 500,
+  "max_resolution": [
+   1024,
+   1024
+  ],
+  "name": "Fixture Rock",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 1
+ },
+ "fx_short": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "date_published": 1700000000,
+  "download_count": 4,
+  "max_resolution": [
+   1024,
+   512
+  ],
+  "name": "Short Sky",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 0
+ },
+ "fx_sky": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "category": "Skies",
+  "date_published": 1700000000,
+  "download_count": 900,
+  "max_resolution": [
+   1024,
+   512
+  ],
+  "name": "Fixture Sky",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 0
+ },
+ "fx_sky2": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "category": "Skies",
+  "date_published": 1700000000,
+  "download_count": 100,
+  "max_resolution": [
+   1024,
+   512
+  ],
+  "name": "Fixture Sky Two",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 0
+ },
+ "fx_slip": {
+  "authors": {
+   "Fixture Author": "All"
+  },
+  "categories": [
+   "fixture"
+  ],
+  "date_published": 1700000000,
+  "dimensions": [
+   200.0,
+   300.0,
+   600.0
+  ],
+  "download_count": 1,
+  "max_resolution": [
+   1024,
+   1024
+  ],
+  "name": "Slipping Box",
+  "tags": [
+   "fixture"
+  ],
+  "thumbnail_url": "{BASE}/files/thumbs/thumb.png?width=256&height=256&format=webp&v=fx1",
+  "type": 2
+ }
+}

@@ -42,6 +42,13 @@ git clone https://github.com/AndreiFlau/blender-mcp-skill "%USERPROFILE%\.claude
   python scripts/bmcp.py -t 600 -f render_job.py
   ```
 
+- `scripts/look.py` (+ `look_blender.py`) — the scene as pictures: angles,
+  camera, frames, viewport, an add-on's UI; any shading; headless or live.
+- `scripts/assets.py` (+ `assets_blender.py`) — search, fetch and import Poly Haven,
+  Poly Pizza and Sketchfab assets, or a local model file, at the right size.
+- `tests/` — the two tools' self-tests (headless, bridge, and windowed checks).
+- `THIRD_PARTY_NOTICES.md` — portions adapted from MCP for Blender (MIT).
+
 ## License
 
 GPL-3.0-or-later (matches the Blender extension it interfaces with).

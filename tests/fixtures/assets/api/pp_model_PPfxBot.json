@@ -1,0 +1,17 @@
+{
+ "Animated": false,
+ "Attribution": "\"Bot Check\" by Fixture Maker, https://poly.pizza/m/PPfxBot. Licence CC-BY 3.0",
+ "Category": "Objects",
+ "Creator": {
+  "Username": "Fixture Maker"
+ },
+ "Download": "{BASE}/botcheck/model.glb",
+ "ID": "PPfxBot",
+ "Licence": "CC-BY 3.0",
+ "Tags": [
+  "box"
+ ],
+ "Thumbnail": "{BASE}/files/thumbs/thumb.png",
+ "Title": "Bot Check",
+ "Tri Count": 24
+}

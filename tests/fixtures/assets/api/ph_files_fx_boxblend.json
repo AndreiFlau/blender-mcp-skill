@@ -1,0 +1,12 @@
+{
+ "blend": {
+  "1k": {
+   "blend": {
+    "include": {},
+    "md5": "d35982b11bb10a8037675029c3a49fd4",
+    "size": 120000,
+    "url": "{BASE}/files/fx_boxblend_1k.blend"
+   }
+  }
+ }
+}

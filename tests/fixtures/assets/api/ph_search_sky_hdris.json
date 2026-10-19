@@ -1,0 +1,17 @@
+{
+ "query": "sky",
+ "results": [
+  {
+   "score": 0.7,
+   "slug": "fx_sky2"
+  },
+  {
+   "score": 0.6,
+   "slug": "fx_sky"
+  },
+  {
+   "score": 0.5,
+   "slug": "not_in_list"
+  }
+ ]
+}

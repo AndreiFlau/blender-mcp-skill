@@ -140,6 +140,32 @@ in the live session unless the user asked.
 - For transferring poses onto existing rigs, recording them and preserving
   native controls, read [live-rigging.md](references/live-rigging.md).
 
+## Seeing the scene, and bringing assets in
+
+Two command-line tools beside `bmcp.py`, for scene building and add-on work alike. Both
+reach the running Blender through the bridge (LIVE, the default; `--expect-file` /
+`--expect-pid` refuse a Blender that is not the one meant) or run a background Blender
+on a file (`--blend FILE`, `--new`). Both print one JSON line and put back everything they
+do not own, checked by a fingerprint of the session before and after. `--help` on each
+has every option and example.
+
+- `scripts/look.py`: pictures of the scene as one labelled sheet plus each view.
+  `--mode angles --target Chair --views front,right,top,three_quarter`,
+  `--mode camera --shading rendered`, `--mode frames --frame-count 8 --center-bones hips`,
+  `--mode viewport` (what the user sees), `--mode ui --ui sidebar:MyAddon` (an add-on's
+  panel, LIVE only); `--shading solid|material|rendered|wireframe|xray`.
+- `scripts/assets.py`: `search` / `fetch` / `import` from Poly Haven (free, no key), Poly
+  Pizza (`POLYPIZZA_API_KEY`) and Sketchfab (`SKETCHFAB_API_TOKEN`): an HDRI becomes a
+  world, a texture a material at real-world size, a model its own collection at `--size`
+  metres on the ground. `import-file` does the same for a local glb/fbx/obj/usd/blend (test
+  fixtures). Credits go into the `ASSET_CREDITS` text; the cache is `BLENDER_AI_ASSETS_DIR`.
+
+Status (2026-10-19): built and self-tested headless and through a bridge on a spare port;
+not yet attacked by a breaker; the windowed paths (`viewport`, `ui`, LIVE import in a GUI
+session) are untested until `tests/look_gui_check.py` and `tests/test_assets.py --only
+G01,G02` run in a windowed Blender. Tests: `tests/test_look.py`, `tests/test_assets.py`.
+Portions adapted from MCP for Blender (MIT): see `THIRD_PARTY_NOTICES.md`.
+
 ## Focused workflows
 
 - Paint canvas, shader layers, dirty image packing and UV/API traps:
