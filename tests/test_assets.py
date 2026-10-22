@@ -6,22 +6,28 @@
     python -X utf8 tests/test_assets.py --work DIR --bridge-zip mcp-1.0.3.zip --bridge-port 9885   # + LIVE rows
     python -X utf8 tests/test_assets.py --work DIR --mutants          # each row again on a planted defect: must FAIL
     --only R05,R07   run some rows      --blender EXE   (else BLENDER_EXE, else the Steam/Program Files install)
+    --scripts DIR    test another copy of assets.py / assets_blender.py / bmcp.py (an older version, to show a
+                     row failing before a fix)
 
 Network-free rows serve recorded API answers and tiny files of our own from tests/fixtures/assets (made by
-fixtures/assets/make_fixtures.py) on 127.0.0.1, by pointing BLENDER_AI_ASSETS_*_API at it. Every row has a
-control (the same measurement where the answer is known) and, with --mutants, is run once more against a
-scratch copy of the scripts with one defect planted; the row must then fail, or it cannot fail at all.
+fixtures/assets/make_fixtures.py and make_attack_fixtures.py) on 127.0.0.1, by pointing BLENDER_AI_ASSETS_*_API
+at it. Every row has a control (the same measurement where the answer is known) and, with --mutants, is run once
+more against a scratch copy of the scripts with one defect planted; the row must then fail, or it cannot fail.
 
 Blenders are started one at a time (plus the bridge Blender in LIVE rows), only with 6000 MB of memory free,
-always --background --factory-startup, with the work folder (keep 'btools' in it) on their command line.
-Prints one line per check and a JSON summary as the last line. Exit code 0 when every row passed.
+always --background --factory-startup, with the work folder (keep 'btools' in it) on their command line. The
+bridge Blender runs with script auto-run ON (--enable-autoexec), the worst case for a downloaded .blend; the rows
+that need Python drivers to run say so and start their Blender the same way. Prints one line per check and a
+JSON summary as the last line. Exit code 0 when every row passed.
 """
 import argparse
+import builtins
 import ctypes
 import hashlib
 import http.server
 import json
 import os
+import pathlib
 import re
 import shutil
 import socket
@@ -30,7 +36,10 @@ import sys
 import threading
 import time
 import urllib.parse
+import zipfile
 from pathlib import Path
+
+sys.dont_write_bytecode = True            # importing assets.py in-process must not leave __pycache__ in the skill
 
 TESTS = Path(__file__).resolve().parent
 SKILL = TESTS.parent
@@ -39,6 +48,14 @@ FORBIDDEN_PORTS = {9876, 8765, 28080, 28081}
 PP_KEY, SF_TOKEN = "fixture-key", "fixture-token"
 SF_OK, SF_SLIP, SF_ABS, SF_GLB = ("sfboxok0000000000000000000000001", "sfslip00000000000000000000000002",
                                   "sfabs000000000000000000000000003", "sfglb000000000000000000000000004")
+SF_BADGLB, SF_ESCAPE = "sfbadglb000000000000000000000005", "sfescape000000000000000000000006"
+
+
+def strict_json(text):
+    """json.loads that refuses NaN and Infinity, as JSON.parse and jq do."""
+    def bad(token):
+        raise ValueError("not JSON: %s" % token)
+    return json.loads(text, parse_constant=bad)
 
 
 # ------------------------------------------------------------------------------------------- environment
@@ -83,7 +100,7 @@ class Ctx:
                   "BLENDER_AI_ASSETS_POLYPIZZA_API", "BLENDER_AI_ASSETS_SKETCHFAB_API"):
             env.pop(k, None)
         env.update({"BLENDER_AI_ASSETS_DIR": str(self.cache), "TEMP": str(self.tmp), "TMP": str(self.tmp),
-                    "BLENDER_EXE": self.blender, "PYTHONIOENCODING": "utf-8"})
+                    "BLENDER_EXE": self.blender, "PYTHONIOENCODING": "utf-8", "PYTHONDONTWRITEBYTECODE": "1"})
         if self.server is not None:
             base = self.server.base
             env.update({"BLENDER_AI_ASSETS_POLYHAVEN_API": base + "/ph", "BLENDER_AI_ASSETS_POLYPIZZA_API": base + "/pp",
@@ -104,9 +121,12 @@ class Ctx:
                               capture_output=True, text=True, encoding="utf-8", errors="replace",
                               env=env or self.env(), timeout=timeout)
         lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        self.last_stdout = proc.stdout
         try:
             answer = json.loads(lines[-1]) if lines else {}
         except ValueError:
+            answer = {"unparsed": proc.stdout[-500:]}
+        if not isinstance(answer, dict):
             answer = {"unparsed": proc.stdout[-500:]}
         return proc.returncode, answer, proc.stderr
 
@@ -138,6 +158,9 @@ class FixtureServer:
                 headers = {k.lower(): v for k, v in self.headers.items()}
                 with outer.lock:
                     outer.log.append({"path": parts.path, "query": query, "headers": headers})
+                if parts.path.startswith("/slow/"):
+                    outer.slow(self, parts.path)
+                    return
                 try:
                     status, ctype, body, extra, cut = outer.route(parts.path, query, headers)
                 except Exception as exc:  # noqa: BLE001
@@ -156,11 +179,63 @@ class FixtureServer:
                     self.close_connection = True
 
         self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.daemon_threads = True
         self.base = "http://127.0.0.1:%d" % self.httpd.server_address[1]
+        self.redirect_to = None
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
     def stop(self):
         self.httpd.shutdown()
+
+    def slow(self, h, path):
+        """Servers that hold a client: trickled headers, a trickled JSON answer, a trickled file, a body that stalls."""
+        if path == "/slow/headers":
+            head = (b"HTTP/1.1 200 OK\r\n" + b"".join(b"X-Pad-%d: %s\r\n" % (i, b"y" * 20) for i in range(15))
+                    + b"Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            try:
+                for i in range(len(head)):
+                    h.wfile.write(head[i:i + 1])
+                    h.wfile.flush()
+                    time.sleep(0.25)
+            except OSError:
+                pass
+            h.close_connection = True
+            return
+        if path == "/slow/json":
+            body, step, pause = b'{"type": 0, "name": "' + b"x" * 400 + b'"}', 1, 0.25
+        elif path == "/slow/file":
+            body, step, pause = b"x" * 8000, 10, 0.25
+        else:
+            body, step, pause = b"x" * 100, 10, 120.0
+        try:
+            h.send_response(200)
+            h.send_header("Content-Type", "application/octet-stream" if path == "/slow/file" else "application/json")
+            h.send_header("Content-Length", str(len(body)))
+            h.end_headers()
+            for i in range(0, len(body), step):
+                h.wfile.write(body[i:i + step])
+                h.wfile.flush()
+                time.sleep(pause)
+        except OSError:
+            pass                                # the client gave up: that is what the row wants
+        h.close_connection = True
+
+    def reshaped(self, rest, query):
+        """Poly Haven answers in shapes the tool has never seen (fields renamed, type a word, checks missing)."""
+        sky = {"url": self.base + "/files/fx_sky_1k.hdr"}
+        sky.update({"size": (FIXTURES / "files" / "fx_sky_1k.hdr").stat().st_size,
+                    "md5": hashlib.md5((FIXTURES / "files" / "fx_sky_1k.hdr").read_bytes()).hexdigest()})
+        info0 = {"name": "Reshaped", "type": 0, "authors": {"Fixture Author": "All"}, "download_count": 1}
+        answers = {
+            "info/x_type": dict(info0, type="hdris"),
+            "info/x_url": info0, "files/x_url": {"hdri": {"1k": {"hdr": {"link": sky["url"], "size": sky["size"],
+                                                                         "md5": sky["md5"]}}}},
+            "info/x_nomd5": info0, "files/x_nomd5": {"hdri": {"1k": {"hdr": {
+                "url": self.base + "/files/fx_short_1k.hdr"}}}},          # a broken file with nothing to check it by
+        }
+        if rest == "search" and query.get("q") == "renamed":
+            return {"query": "renamed", "hits": [{"slug": "fx_sky"}]}
+        return answers.get(rest)
 
     def count(self):
         with self.lock:
@@ -179,6 +254,11 @@ class FixtureServer:
     def route(self, path, query, headers):
         js = lambda body, status=200: (status, "application/json", body, {}, False)  # noqa: E731
         notfound = (404, "text/plain", b"not found", {}, False)
+        if path.startswith("/phx/"):
+            answer = self.reshaped(path[5:], query)
+            if answer is not None:
+                return js(json.dumps(answer).encode("utf-8"))
+            return self.route("/ph/" + path[5:], query, headers)
         if path.startswith("/ph/"):
             rest = path[4:]
             if rest == "assets":
@@ -202,6 +282,8 @@ class FixtureServer:
             if headers.get("x-auth-token") != PP_KEY:
                 return (401, "application/json", b'{"error": "You need an API key"}', {}, False)
             rest = path[4:]
+            if rest == "model/PPfxHop" and self.redirect_to:          # a redirect to another host
+                return (302, "text/plain", b"", {"Location": self.redirect_to + "/pp/model/PPfxCrate"}, False)
             if rest.startswith("search/"):
                 body = self.api("pp_search_%s.json" % urllib.parse.unquote(rest[7:]))
                 return js(body) if body else js(b'{"total": 0, "results": []}')
@@ -313,6 +395,7 @@ def tree(nt):
         if n.bl_idname == "ShaderNodeBackground": d["strength"] = n.inputs["Strength"].default_value
         if n.bl_idname == "ShaderNodeDisplacement": d["scale"] = n.inputs["Scale"].default_value; d["midlevel"] = n.inputs["Midlevel"].default_value
         if n.bl_idname == "ShaderNodeMath": d["op"] = n.operation
+        if n.bl_idname == "ShaderNodeUVMap": d["uv_map"] = n.uv_map
         nodes[n.name] = d
     links = [[l.from_node.name, l.from_socket.name, l.to_node.name, l.to_socket.name] for l in nt.links]
     return {"nodes": nodes, "links": links}
@@ -349,11 +432,11 @@ with open(out, "w", encoding="utf-8") as f:
 '''
 
 
-def blender_run(ctx, blend, script_text, script_name, *extra):
+def blender_run(ctx, blend, script_text, script_name, *extra, autoexec=False):
     wait_memory()
     script = ctx.work / script_name
     script.write_text(script_text, encoding="utf-8")
-    cmd = [ctx.blender, "--background", "--factory-startup", "--disable-autoexec"]
+    cmd = [ctx.blender, "--background", "--factory-startup", "--enable-autoexec" if autoexec else "--disable-autoexec"]
     if blend:
         cmd.append(str(blend))
     cmd += ["--python-exit-code", "3", "--python", str(script), "--", *[str(e) for e in extra]]
@@ -380,6 +463,246 @@ def make_scene(ctx):
         if not target.is_file():
             raise RuntimeError("could not make the test scene, see %s" % log)
     return target
+
+
+SCENE2_SCRIPT = r'''
+import bpy, sys
+out, unit = sys.argv[sys.argv.index("--") + 1:][:2]
+k = 100.0 if unit == "cm" else 1.0
+bpy.ops.wm.read_homefile(use_empty=True)
+scene = bpy.context.scene
+if unit == "cm":
+    scene.unit_settings.system = "METRIC"; scene.unit_settings.scale_length = 0.01
+    scene.unit_settings.length_unit = "CENTIMETERS"
+def mat(name, rgb):
+    m = bpy.data.materials.new(name); m.use_nodes = True
+    next(n for n in m.node_tree.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled").inputs["Base Color"].default_value = rgb + (1,)
+    return m
+bpy.ops.mesh.primitive_plane_add(size=2 * k); floor = bpy.context.object; floor.name = "Floor"
+floor.data.materials.append(mat("FloorMat", (0.5, 0.5, 0.5)))
+bpy.ops.mesh.primitive_plane_add(size=2 * k, location=(0, 4 * k, 0)); two = bpy.context.object; two.name = "TwoUV"
+me = two.data; me.uv_layers[0].name = "UVrender"
+small = me.uv_layers.new(name="UVsmall")
+for d in small.data: d.uv = (d.uv[0] * 0.1, d.uv[1] * 0.1)
+me.uv_layers.active = small                      # the map being edited
+me.uv_layers["UVrender"].active_render = True    # the map renders use
+two.data.materials.append(mat("TwoUVMat", (0.3, 0.3, 0.3)))
+bpy.ops.mesh.primitive_cube_add(size=1 * k, location=(3 * k, 0, 0.5 * k)); ms = bpy.context.object; ms.name = "MultiSlot"
+for name, rgb in (("MatA", (1, 0, 0)), ("MatB", (0, 1, 0)), ("MatC", (0, 0, 1))):
+    ms.data.materials.append(mat(name, rgb))
+for i, poly in enumerate(ms.data.polygons): poly.material_index = i % 3
+for ob in scene.objects: ob.select_set(ob.name == "Floor")
+bpy.context.view_layer.objects.active = floor
+bpy.ops.wm.save_as_mainfile(filepath=out)
+print("SCENE2_SAVED", out, [l.name for l in me.uv_layers if l.active_render], me.uv_layers.active.name)
+'''
+
+NAN_SCRIPT = r'''
+import bpy, sys
+out = sys.argv[sys.argv.index("--") + 1]
+e = bpy.data.objects.new("Broken", None); bpy.context.scene.collection.objects.link(e)
+e.location = (float("nan"), 0.0, 0.0)
+bpy.ops.wm.save_as_mainfile(filepath=out, copy=True)
+'''
+
+TRAP_SCRIPT = r'''
+import bpy, sys, os
+out, markers = sys.argv[sys.argv.index("--") + 1:][:2]
+bpy.ops.wm.read_homefile(use_empty=True)
+bpy.ops.mesh.primitive_cube_add(size=1, location=(0, 0, 0.5)); ob = bpy.context.object; ob.name = "TrapCube"
+ob.shape_key_add(name="Basis"); ob.shape_key_add(name="Key 1")
+def expr(tag):
+    # Blender keeps 255 characters of a driver expression and cuts the rest: a full marker path in a deep work
+    # folder came out as an unterminated string that never ran, so the control failed. The folder comes from the
+    # environment (BTOOLS_TRAP_ROOT, set by the test for every Blender it starts) and only its last part is here.
+    text = ("(__import__('pathlib').Path(__import__('os').environ['BTOOLS_TRAP_ROOT'], '%s', 'ran_%s.txt')"
+            ".write_text('ran') and 0.0) or 0.0" % (os.path.basename(markers), tag))
+    if len(text) > 255:
+        raise SystemExit("driver expression too long for Blender (%d characters)" % len(text))
+    return text
+def drive(owner, path, tag):
+    fc = owner.driver_add(path); fc.driver.type = "SCRIPTED"; fc.driver.expression = expr(tag)
+drive(ob.data.shape_keys.key_blocks["Key 1"], "value", "shape_key")
+mat = bpy.data.materials.new("TrapMat"); mat.use_nodes = True; ob.data.materials.append(mat)
+bsdf = next(n for n in mat.node_tree.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled")
+drive(bsdf.inputs["Roughness"], "default_value", "material_node_tree")
+ob["p"] = 0.0; drive(ob, '["p"]', "object")
+ob.data["q"] = 0.0; drive(ob.data, '["q"]', "mesh")
+bpy.ops.wm.save_as_mainfile(filepath=out)
+print("TRAP_SAVED", out)
+'''
+
+TRAP_CONTROL = r'''
+import os
+before = set(os.listdir(job["_markers"])) if os.path.isdir(job["_markers"]) else set()
+with bpy.data.libraries.load(job["_trap"], link=False) as (src, dst):
+    dst.objects = list(src.objects)
+for ob in dst.objects:
+    bpy.context.scene.collection.objects.link(ob)
+bpy.context.view_layer.update()
+bpy.context.scene.frame_set(2)
+bpy.context.scene.frame_set(1)
+facts["markers"] = sorted(set(os.listdir(job["_markers"])) - before) if os.path.isdir(job["_markers"]) else []
+'''
+
+
+def make_scene2(ctx, unit="m"):
+    target = ctx.work / ("scene2_%s.blend" % unit)
+    if not target.is_file():
+        blender_run(ctx, None, SCENE2_SCRIPT, "make_scene2.py", target, unit)
+        if not target.is_file():
+            raise RuntimeError("could not make %s" % target)
+    return target
+
+
+def make_trap(ctx, name):
+    """A .blend with Python drivers on an object, its mesh, a shape key and a material node tree; each writes a
+    marker file named for where it sits into its own folder when it runs."""
+    markers = ctx.work / ("markers_" + name)
+    shutil.rmtree(markers, ignore_errors=True)
+    markers.mkdir(parents=True)
+    trap = ctx.work / ("trap_%s.blend" % name)
+    if trap.exists():
+        trap.unlink()
+    blender_run(ctx, None, TRAP_SCRIPT, "make_trap.py", trap, markers)
+    if not trap.is_file():
+        raise RuntimeError("could not make %s" % trap)
+    return trap, markers
+
+
+INBLENDER_SCRIPT = r'''
+import sys, json, runpy, os, traceback, bpy
+argv = sys.argv[sys.argv.index("--") + 1:]
+module, job_path, out_path = argv[0], argv[1], argv[2]
+with open(job_path, encoding="utf-8") as f:
+    job = json.load(f)
+facts = {}
+try:
+    ns = runpy.run_path(module, run_name="assets_blender_under_test")
+    g = ns["run_job"].__globals__
+    env = {"bpy": bpy, "g": g, "job": job, "facts": facts, "os": os, "json": json}
+    if job.get("_pre"):
+        exec(job["_pre"], env)
+    res = g["run_job"](job) if job.get("op") else {"ok": True, "skipped": "no job"}
+    env["res"] = res
+    if job.get("_post"):
+        exec(job["_post"], env)
+    if job.get("_save") and res.get("ok"):
+        bpy.ops.wm.save_as_mainfile(filepath=job["_save"], copy=True)
+except Exception:
+    res = {"ok": False, "harness_error": traceback.format_exc()}
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump({"result": res, "facts": facts}, f, default=str)
+'''
+
+
+def inblender(ctx, blend, job, name, autoexec=False):
+    """Run assets_blender.run_job on `job` in a background Blender, with optional _pre/_post code (bpy, g = the
+    module's globals, job, facts, res); returns {"result", "facts"}."""
+    job = dict(job)
+    job.setdefault("mode", "headless")
+    job_path, out = ctx.work / (name + "_job.json"), ctx.work / (name + "_out.json")
+    job_path.write_text(json.dumps(job), encoding="utf-8")
+    if out.exists():
+        out.unlink()
+    code, log = blender_run(ctx, blend, INBLENDER_SCRIPT, name + ".py", ctx.scripts / "assets_blender.py", job_path, out,
+                            autoexec=autoexec)
+    if not out.is_file():
+        raise RuntimeError("the in-Blender run %s failed (exit %d), see %s" % (name, code, log))
+    return json.loads(out.read_text(encoding="utf-8"))
+
+
+def job_options(**kw):
+    opts = {"size": None, "at": [0.0, 0.0, 0.0], "ground": True, "rotate": 0.0, "name": None, "strength": 1.0,
+            "rotation": 0.0, "replace_world": False, "apply_to": [], "slot": None, "pack": False,
+            "keep_lights": False, "keep_cameras": False, "picks": [], "prefer_collections": []}
+    opts.update(kw)
+    return opts
+
+
+def texture_job(**kw):
+    files = FIXTURES / "files"
+    maps = [{"path": str(files / "fx_rock_diff_1k.jpg"), "role": "base_color", "key": "Diffuse"},
+            {"path": str(files / "fx_rock_rough_1k.jpg"), "role": "roughness", "key": "Rough"},
+            {"path": str(files / "fx_rock_nor_gl_1k.jpg"), "role": "normal", "key": "nor_gl"},
+            {"path": str(files / "fx_rock_disp_1k.jpg"), "role": "displacement", "key": "Displacement"}]
+    meta = {"source": "polyhaven", "id": "fx_rock", "name": "Fixture Rock", "kind": "texture", "author": "Fixture Author",
+            "license": "CC0", "page_url": "https://polyhaven.com/a/fx_rock", "dimensions_m": [1.8, 1.8],
+            "displacement_scale": 0.02, "skipped_maps": []}
+    return {"op": "import", "kind": "texture", "files": {"maps": maps}, "meta": meta, "options": job_options(**kw)}
+
+
+def model_job(path, **kw):
+    path = Path(path)
+    meta = {"source": "file", "id": path.name, "name": path.stem, "kind": "model", "author": "",
+            "license": "unknown (a local file)", "page_url": "local file"}
+    return {"op": "import", "kind": "model", "files": {"main": str(path)}, "meta": meta, "options": job_options(**kw)}
+
+
+def load_assets(ctx):
+    """The assets.py under test, imported in this process (for rows that patch its writers or its clock)."""
+    import importlib
+    sys.path.insert(0, str(ctx.scripts))
+    try:
+        sys.modules.pop("assets", None)
+        return importlib.import_module("assets")
+    finally:
+        sys.path.pop(0)
+
+
+def in_thread(fn, seconds):
+    """(finished, value or exception) of fn() given `seconds` at most: a hang is a result, not a stuck suite."""
+    box = {}
+
+    def run():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            box["error"] = exc
+    t = threading.Thread(target=run, daemon=True)
+    started = time.time()
+    t.start()
+    t.join(seconds)
+    box["seconds"] = round(time.time() - started, 1)
+    return (not t.is_alive()), box
+
+
+class LogServer:
+    """A second host: logs what reaches it (headers included) and answers 404."""
+
+    def __init__(self):
+        self.log = []
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                outer.log.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}})
+                self.send_response(404)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.daemon_threads = True
+        self.base = "http://127.0.0.1:%d" % self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.httpd.shutdown()
+
+
+def short_path(path):
+    """The 8.3 form of an existing path on Windows (None elsewhere or when there is none)."""
+    if os.name != "nt":
+        return None
+    full = "\\\\?\\" + os.path.abspath(str(path))
+    n = ctypes.windll.kernel32.GetShortPathNameW(full, None, 0)
+    if not n:
+        return None
+    buf = ctypes.create_unicode_buffer(n + 1)
+    ctypes.windll.kernel32.GetShortPathNameW(full, buf, n + 1)
+    return buf.value[4:] if buf.value.startswith("\\\\?\\") else buf.value
 
 
 def links_into(tree, node_name):
@@ -573,6 +896,11 @@ def r05(ctx, c):
     after2 = probe(ctx, out2) if out2.is_file() else {"worlds": {"UserWorld": {}}}
     c("--replace-world: no fake user, so the unused old world is gone from the saved file", code == 0
       and "UserWorld" not in after2["worlds"], list(after2["worlds"]))
+    out3 = ctx.work / "r05c.blend"
+    code, ans, err = ctx.headless("import", "polyhaven", "fx_sky", "--blend", scene, "--save-as", out3, "--pack")
+    after3 = probe(ctx, out3) if out3.is_file() else {"images": {}}
+    hdr = [i for i in after3["images"].values() if i["file"].endswith("fx_sky_1k.hdr")]
+    c("--pack: the HDRI's image is packed into the saved file", code == 0 and hdr and all(i["packed"] for i in hdr), hdr)
 
 
 @row("R06 texture import (headless): every map wired, real-world tiling, shared mesh protected")
@@ -757,10 +1085,16 @@ def r11(ctx, c):
     c("unknown id: HTTP 404 said plainly", code == 1 and "has no asset 'nope_zz'" in ans.get("error", ""), ans.get("error"))
     n = ctx.server.count()
     code, ans, err = ctx.tool("fetch", "polyhaven", "../etc/passwd")
-    c("bad id: refused before any request", code == 1 and "is not a Poly Haven id" in ans.get("error", "") and ctx.server.count() == n,
-      (ans.get("error"), ctx.server.since(n)))
+    c("bad id: refused before any request (exit 2, a bad argument)", code == 2 and "is not a Poly Haven id" in ans.get("error", "")
+      and ctx.server.count() == n, (code, ans.get("error"), ctx.server.since(n)))
     code, ans, err = ctx.tool("fetch", "polyhaven", "fx_sky", "--res", "9k")
     c("a resolution it does not have: says what it has", code == 1 and "it has 1k" in ans.get("error", ""), ans.get("error"))
+    shutil.rmtree(ctx.cache / "polyhaven" / "fx_http", ignore_errors=True)
+    n = ctx.server.count()
+    code, ans, err = ctx.tool("fetch", "polyhaven", "fx_http")
+    files = [r["path"] for r in ctx.server.since(n) if r["path"].startswith("/files/")]
+    c("a file address on plain http to another host: refused (only https)", code == 1 and "only https" in ans.get("error", "")
+      and not (ctx.cache / "polyhaven" / "fx_http" / "hdri-1k-hdr" / "manifest.json").exists() and not files, ans.get("error"))
 
 
 @row("R12 a full disk: plain reason, nothing kept")
@@ -844,6 +1178,19 @@ def r14(ctx, c):
     c("the file server got no key", cdn and not any("x-auth-token" in r["headers"] for r in cdn), cdn)
     code, ans, err = ctx.tool("fetch", "polypizza", "PPfxBot")
     c("a bot check is named as such", code == 1 and "bot check" in ans.get("error", ""), ans.get("error"))
+    other = LogServer()
+    try:
+        ctx.server.redirect_to = other.base
+        n = ctx.server.count()
+        code, ans, err = ctx.tool("fetch", "polypizza", "PPfxHop")
+        first = [r for r in ctx.server.since(n) if r["path"] == "/pp/model/PPfxHop"]
+        c("control: the first host got the key and answered with a redirect", first
+          and first[0]["headers"].get("x-auth-token") == PP_KEY and other.log, (first[:1], other.log))
+        c("the key is not sent on to the host a redirect points at", other.log
+          and not any("x-auth-token" in r["headers"] for r in other.log), other.log)
+    finally:
+        ctx.server.redirect_to = None
+        other.stop()
     out = ctx.work / "r14.blend"
     code, ans, err = ctx.headless("import", "polypizza", "PPfxCrate", "--blend", make_scene(ctx), "--save-as", out, "--size", "1.0")
     imp = ans.get("import", {})
@@ -860,6 +1207,10 @@ def r15(ctx, c):
       and r.get("author") == "Fixture Artist" for r in recs), recs[:1])
     code, ans, err = ctx.tool("fetch", "sketchfab", SF_GLB)
     c("glb download checked (header length = file size)", code == 0 and ans.get("variant") == "model-glb", ans.get("error"))
+    shutil.rmtree(ctx.cache / "sketchfab" / SF_BADGLB, ignore_errors=True)
+    code, ans, err = ctx.tool("fetch", "sketchfab", SF_BADGLB)
+    c("a glb whose header claims 5000 bytes: refused, nothing cached", code == 1 and "header says 5000" in ans.get("error", "")
+      and not (ctx.cache / "sketchfab" / SF_BADGLB / "model-glb" / "manifest.json").exists(), ans.get("error"))
     out = ctx.work / "r15.blend"
     code, ans, err = ctx.headless("import", "sketchfab", SF_OK, "--blend", make_scene(ctx), "--save-as", out, "--size", "0.5")
     imp = ans.get("import", {})
@@ -969,11 +1320,31 @@ def r17(ctx, c):
     imp = ans.get("import", {})
     c("a broken file: the importer's error, scene unchanged", code == 1 and "importer failed" in ans.get("error", "")
       and imp.get("scene_unchanged") is True, ans.get("error"))
-    code, ans, err = ctx.tool("import-file", kit / "kit.glb", "--blend", scene, "--save-as", scene)
-    c("--save-as over the input file: refused", code == 1 and "never saves over it" in ans.get("error", ""), ans.get("error"))
+    spellings = [("as given", str(scene)), ("upper case", str(scene).upper()),
+                 ("with '..'", str(scene.parent / ".." / scene.parent.name / scene.name))]
+    short = short_path(scene)
+    if short and short != str(scene):
+        spellings.append(("8.3 short form", short))
+    hard = ctx.work / "scene_hard_link.blend"          # another name for the same file, which resolve() keeps apart
+    if hard.exists():
+        hard.unlink()
+    try:
+        os.link(scene, hard)
+        spellings.append(("a hard link to it", str(hard)))
+    except OSError as exc:
+        print("  (no hard link on this disk: %s)" % exc, flush=True)
+    before_bytes = hashlib.sha256(scene.read_bytes()).hexdigest()
+    for label, spelling in spellings:
+        code, ans, err = ctx.tool("import-file", kit / "kit.glb", "--blend", scene, "--save-as", spelling)
+        c("--save-as over the input file (%s): refused, exit 3" % label, code == 3 and "never saves over it" in ans.get("error", ""),
+          (code, ans.get("error"), spelling))
+    c("the input file's bytes are unchanged after all of them", hashlib.sha256(scene.read_bytes()).hexdigest() == before_bytes)
+    if hard.exists():
+        hard.unlink()
     code, ans, err = ctx.tool("import-file", kit / "kit.glb", "--save-as", ctx.work / "x.blend",
                               env=ctx.env(BLENDER_MCP_PORT="1"))
-    c("--save-as on a live session: refused", code == 1 and "live session is never saved" in ans.get("error", ""), ans.get("error"))
+    c("--save-as on a live session: refused as a bad argument", code == 2 and "live session is never saved" in ans.get("error", ""),
+      (code, ans.get("error")))
     after = probe(ctx, scene)
     c("control: the input scene file itself is unchanged", after == before)
 
@@ -987,11 +1358,15 @@ def r18(ctx, c):
     env = ctx.env(BLENDER_MCP_HOST="127.0.0.1", BLENDER_MCP_PORT=port)
     look = LIVE_LOOK
     state0 = bridge_exec(port, look)
-    code, ans, err = ctx.tool("import", "polyhaven", "fx_box", "--expect-pid", str(pid + 100000), env=env)
-    c("wrong --expect-pid: refused, nothing touched", code == 1 and "WRONG BLENDER" in ans.get("error", "")
-      and ans.get("import", {}).get("touched") is False, ans.get("error"))
+    shutil.rmtree(ctx.cache / "polyhaven" / "fx_sky2", ignore_errors=True)
+    n = ctx.server.count()
+    code, ans, err = ctx.tool("import", "polyhaven", "fx_sky2", "--expect-pid", str(pid + 100000), env=env)
+    c("wrong --expect-pid: refused (exit 3), nothing touched", code == 3 and "WRONG BLENDER" in ans.get("error", "")
+      and ans.get("touched", ans.get("import", {}).get("touched")) is False, (code, ans.get("error")))
+    c("the Blender is asked who it is before anything is downloaded", ctx.server.count() == n, ctx.server.since(n))
+    c("the refusal is said on stderr too", "assets: FAILED (refused)" in err, err[-300:])
     code, ans, err = ctx.tool("import", "polyhaven", "fx_box", "--expect-file", "other.blend", env=env)
-    c("wrong --expect-file: refused", code == 1 and "WRONG BLENDER" in ans.get("error", ""), ans.get("error"))
+    c("wrong --expect-file: refused (exit 3)", code == 3 and "WRONG BLENDER" in ans.get("error", ""), (code, ans.get("error")))
     c("control: the scene after refusals is as before", bridge_exec(port, look) == state0)
     e0 = bridge_exec(port, EDIT_ON)
     c("control: the live Blender is in Edit Mode with an edit not yet written to the mesh",
@@ -1016,6 +1391,52 @@ def r18(ctx, c):
     state2 = bridge_exec(port, look)
     c("a live failure is rolled back", code == 1 and ans.get("import", {}).get("scene_unchanged") is True and state2 == state1,
       ans.get("error"))
+    e2 = bridge_exec(port, EDIT_ON)
+    code, ans, err = ctx.tool("import", "polyhaven", "fx_rock", "--apply-to", "Floor", "--expect-pid", str(pid), env=env)
+    e3 = bridge_exec(port, EDIT_LOOK)
+    c("a texture onto Floor while it is in Edit Mode: ok, Edit Mode back, the unsaved edit kept",
+      code == 0 and e3["mode"] == "EDIT_MESH" and e3["editing"] == e2["editing"] and abs((e3["z"] or 0) - e2["z"]) < 1e-6,
+      (code, ans.get("error"), e2, e3))
+    bridge_exec(port, EDIT_OFF)
+    # A .blend with Python drivers, appended LIVE into this auto-run Blender: none of them may run.
+    trap, markers = make_trap(ctx, "live")
+    control, control_markers = make_trap(ctx, "live_control")
+    code, ans, err = ctx.tool("import-file", trap, "--expect-pid", str(pid), env=env)
+    bridge_exec(port, EVALUATE)
+    ran = sorted(p.name for p in markers.iterdir())
+    c("LIVE .blend: imported, its Python drivers muted", code == 0 and len(ans.get("import", {}).get("scripted_drivers_muted") or []) >= 4,
+      (ans.get("error"), ans.get("import", {}).get("scripted_drivers_muted")))
+    c("LIVE .blend in an auto-run Blender: no driver ran (no marker written)", not ran, ran)
+    bridge_exec(port, CONTROL_APPEND % str(control))
+    ran_control = sorted(p.name for p in control_markers.iterdir())
+    c("control: a plain append of the same kind of file in this Blender does run them",
+      {"ran_shape_key.txt", "ran_material_node_tree.txt", "ran_object.txt"} <= set(ran_control), ran_control)
+
+
+EVALUATE = r'''
+import bpy
+scene = bpy.context.scene
+bpy.context.view_layer.update()
+f = scene.frame_current
+scene.frame_set(f + 1)
+scene.frame_set(f)
+bpy.context.evaluated_depsgraph_get()
+result = {"frame": scene.frame_current}
+'''
+
+CONTROL_APPEND = r'''
+import bpy
+with bpy.data.libraries.load(%r, link=False) as (src, dst):
+    dst.objects = list(src.objects)
+for ob in dst.objects:
+    bpy.context.scene.collection.objects.link(ob)
+scene = bpy.context.scene
+bpy.context.view_layer.update()
+f = scene.frame_current
+scene.frame_set(f + 1)
+scene.frame_set(f)
+result = {"appended": [o.name for o in dst.objects]}
+'''
 
 
 EDIT_ON = r'''
@@ -1140,7 +1561,8 @@ def start_bridge(ctx, zip_path, port, blend):
     shutil.copyfile(blend, live_blend)
     log = ctx.work / "bridge.log"
     wait_memory()
-    proc = subprocess.Popen([ctx.blender, "--background", "--factory-startup", "--disable-autoexec", str(live_blend),
+    # Script auto-run ON: the worst case for a downloaded .blend (R18 shows its Python drivers stay muted).
+    proc = subprocess.Popen([ctx.blender, "--background", "--factory-startup", "--enable-autoexec", str(live_blend),
                              "--python", str(boot), "--", str(pkg), str(port)],
                             stdout=open(log, "wb"), stderr=subprocess.STDOUT)
     for _ in range(120):
@@ -1201,6 +1623,655 @@ def r19(ctx, c):
     c("a .blend in a folder with spaces in and out", code == 0 and out.is_file(), ans.get("error"))
     c("nothing written beside the input .blend but the asked --save-as", sorted(p.name for p in spaced.iterdir())
       == ["my scene out.blend", "my scene.blend"], sorted(p.name for p in spaced.iterdir()))
+    code, ans, err = ctx.tool("import", "polyhaven", "fx_box", "--new", "--dry-run", "--blender", str(ctx.work / "nope.exe"))
+    c("--blender that is not a file: refused as a bad argument", code == 2 and "--blender" in ans.get("error", ""), (code, ans.get("error")))
+    tmp_dir = ctx.work / "own tmp"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    code, ans, err = ctx.headless("import", "polyhaven", "fx_box", "--new", "--dry-run", "--tmp-dir", tmp_dir,
+                                  "--blender", ctx.blender, env=ctx.env(BLENDER_AI_ASSETS_KEEP_WORK="1"))
+    kept = list(tmp_dir.glob("blender_ai_assets_*/blender.log")) if tmp_dir.exists() else []
+    c("--tmp-dir and --blender are used (the job's log lands in --tmp-dir)", code == 0 and kept, (ans.get("error"), kept))
+
+
+# ------------------------------------------------------------------------------------------- attack rows (2026-10-22)
+# One row per finding of the breakers (bt_break_assets, bt_fresh); each was shown failing on the code it found.
+
+@row("R20 a .blend's Python drivers (object, mesh, shape key, material node tree) never run, even with auto-run on")
+def r20(ctx, c):
+    control_trap, control_markers = make_trap(ctx, "control")
+    res = inblender(ctx, None, {"op": None, "_pre": TRAP_CONTROL, "_trap": str(control_trap),
+                                "_markers": str(control_markers)}, "r20_control", autoexec=True)
+    ran = set(res["facts"].get("markers") or [])
+    c("control: in an auto-run Blender a plain append runs all four drivers",
+      {"ran_shape_key.txt", "ran_material_node_tree.txt", "ran_object.txt", "ran_mesh.txt"} <= ran, (ran, res["result"]))
+    trap, markers = make_trap(ctx, "tool")
+    post = ("bpy.context.view_layer.update(); s = bpy.context.scene; s.frame_set(2); s.frame_set(1)\n"
+            "bpy.context.evaluated_depsgraph_get()\n"
+            "facts['markers'] = sorted(os.listdir(job['_markers']))\n"
+            "facts['shape_keys'] = len(bpy.data.shape_keys)\n"
+            "facts['muted_now'] = sorted('%s %s' % (k.name, fc.data_path) for k in bpy.data.shape_keys "
+            "if k.animation_data for fc in k.animation_data.drivers if fc.mute)\n")
+    res = inblender(ctx, make_scene(ctx), dict(model_job(trap), _post=post, _markers=str(markers)), "r20_tool", autoexec=True)
+    out, facts = res["result"], res["facts"]
+    muted = out.get("scripted_drivers_muted") or []
+    c("the import itself is ok", out.get("ok"), out.get("error") or out.get("harness_error"))
+    c("no driver ran: no marker written", out.get("ok") is not None and not facts.get("markers"), facts.get("markers"))
+    c("all four are listed as muted (shape key and node tree included)", len(muted) >= 4
+      and any("shape keys" in m for m in muted) and any("node tree" in m for m in muted), muted)
+    pre = "facts['keys_before'] = len(bpy.data.shape_keys)\ng['add_credit'] = lambda *a: (_ for _ in ()).throw(RuntimeError('planted failure'))\n"
+    post = "facts['keys_after'] = len(bpy.data.shape_keys)\nfacts['markers'] = sorted(os.listdir(job['_markers']))\n"
+    res = inblender(ctx, make_scene(ctx), dict(model_job(trap), _pre=pre, _post=post, _markers=str(markers)), "r20_fail",
+                    autoexec=True)
+    out, facts = res["result"], res["facts"]
+    c("a failure after the append removes the shape keys it brought too, and nothing ran",
+      out.get("ok") is False and out.get("scene_unchanged") is True and facts.get("keys_after") == facts.get("keys_before")
+      and not facts.get("markers"), (out.get("error"), facts))
+
+
+@row("R21 nan/inf and out-of-range numbers: refused before any request or Blender; a NaN in the scene locks nothing")
+def r21(ctx, c):
+    kit = ensure_kit(ctx)
+    out = ctx.work / "r21.blend"
+    lines = []
+    for flag, value in (("--size", "inf"), ("--size", "nan"), ("--size", "-1"), ("--at", "nan,0,0"), ("--at", "1,2"),
+                        ("--rotate", "nan"), ("--strength", "nan"), ("--rotation", "inf"), ("--timeout", "0"),
+                        ("--timeout", "nan")):
+        if out.exists():
+            out.unlink()
+        started = time.time()
+        code, ans, err = ctx.tool("import-file", kit / "kit.glb", "--new", "--save-as", out, flag, value)
+        lines.append(ctx.last_stdout)
+        c("%s %s: a bad argument (exit 2), no Blender started" % (flag, value), code == 2 and ans.get("code") == "bad_args"
+          and not out.exists() and "Blender:" not in err and time.time() - started < 20, (code, ans.get("error"), err[-200:]))
+    n = ctx.server.count()
+    shutil.rmtree(ctx.cache / "polyhaven" / "fx_box", ignore_errors=True)
+    code, ans, err = ctx.tool("import", "polyhaven", "fx_box", "--size", "inf", "--new", "--save-as", out)
+    lines.append(ctx.last_stdout)
+    c("an asset with --size inf: refused before any request", code == 2 and ctx.server.count() == n, ctx.server.since(n))
+    nan_scene = ctx.work / "nan_scene.blend"
+    if not nan_scene.exists():
+        blender_run(ctx, make_scene(ctx), NAN_SCRIPT, "make_nan.py", nan_scene)
+    code, ans, err = ctx.headless("import", "polyhaven", "fx_box", "--blend", nan_scene, "--save-as", out, "--size", "0.5")
+    lines.append(ctx.last_stdout)
+    c("a scene holding a NaN location: the import works (the fingerprint is stable)", code == 0 and out.exists(),
+      (code, ans.get("error")))
+    bad = []
+    for text in lines:
+        for line in [l for l in text.splitlines() if l.strip()]:
+            try:
+                strict_json(line)
+            except ValueError as exc:
+                bad.append("%s: %s" % (exc, line[:80]))
+    c("every stdout line is strict JSON (no bare NaN or Infinity)", lines and not bad, bad[:3])
+
+
+@row("R22 a centimetre scene: --size, --at and texture tiling are metres; the JSON says metres")
+def r22(ctx, c):
+    scene = make_scene2(ctx, "cm")
+    out = ctx.work / "r22a.blend"
+    code, ans, err = ctx.headless("import", "polyhaven", "fx_box", "--blend", scene, "--save-as", out, "--size", "1.2",
+                                  "--at", "2,1,0.5")
+    imp = ans.get("import", {})
+    c("import ok", code == 0, ans.get("error"))
+    after = probe(ctx, out) if out.exists() else {"collections": {}}
+    b = (after["collections"].get(imp.get("collection")) or {}).get("bounds") or {"size": [0], "min": [0, 0, 0], "max": [0, 0, 0]}
+    c("largest side 1.2 m = 120 Blender units (within 1 %)", abs(max(b["size"]) - 120.0) <= 1.2, b["size"])
+    c("lowest point at 0.5 m = 50 units, centred on (2, 1) m = (200, 100) units", abs(b["min"][2] - 50.0) < 1e-3
+      and abs((b["min"][0] + b["max"][0]) / 2 - 200.0) < 1e-3 and abs((b["min"][1] + b["max"][1]) / 2 - 100.0) < 1e-3, b)
+    c("the JSON gives metres: final_largest_m 1.2", abs((imp.get("final_largest_m") or 0) - 1.2) < 0.012, imp.get("final_largest_m"))
+    code, ans, err = ctx.headless("import", "polyhaven", "fx_box", "--blend", scene, "--save-as", ctx.work / "r22b.blend")
+    imp = ans.get("import", {})
+    c("no --size: the real size, and it is recognised as the published one", code == 0
+      and imp.get("authored_matches_published") is True, (imp.get("authored_size_m"), imp.get("published_size_m")))
+    out = ctx.work / "r22c.blend"
+    code, ans, err = ctx.headless("import", "polyhaven", "fx_rock", "--blend", scene, "--save-as", out, "--apply-to", "Floor")
+    after = probe(ctx, out) if out.exists() else None
+    tree = after["materials"][after["objects"]["Floor"]["slots"][0][1]]["tree"] if after else {"nodes": {}}
+    mapping = next((d for d in tree["nodes"].values() if d["type"] == "ShaderNodeMapping"), {"scale": [0, 0, 0]})
+    disp = next((d for d in tree["nodes"].values() if d["type"] == "ShaderNodeDisplacement"), {})
+    c("the 2 m floor (200 units) tiles at the texture's 1.8 m: Mapping 2/1.8", code == 0
+      and all(abs(v - 2 / 1.8) < 1e-3 for v in mapping["scale"][:2]), mapping["scale"])
+    c("displacement 0.02 m = 2 units", abs(disp.get("scale", 0) - 2.0) < 1e-6, disp)
+
+
+@row("R23 big downloads: refused over --max-mb before the first file byte; the free disk space is checked")
+def r23(ctx, c):
+    shutil.rmtree(ctx.cache / "polyhaven" / "fx_huge", ignore_errors=True)
+    n = ctx.server.count()
+    code, ans, err = ctx.tool("fetch", "polyhaven", "fx_huge", "--res", "24k", "--format", "exr")
+    files = [r["path"] for r in ctx.server.since(n) if r["path"].startswith("/files/")]
+    c("a 2.45 GB EXR: refused (exit 3), the size and --max-mb named", code == 3 and "GB" in ans.get("error", "")
+      and "--max-mb" in ans.get("error", ""), (code, ans.get("error")))
+    c("refused before any file request", not files, files)
+    n = ctx.server.count()
+    code, ans, err = ctx.tool("fetch", "polyhaven", "fx_huge", "--res", "24k", "--format", "exr", "--max-mb", "3000")
+    files = [r["path"] for r in ctx.server.since(n) if r["path"].startswith("/files/")]
+    c("control: with --max-mb 3000 the download is tried (and the small file is then refused on its size)",
+      files and code == 1, (code, ans.get("error"), files))
+    assets = load_assets(ctx)
+    saved = {k: os.environ.get(k) for k in ("BLENDER_AI_ASSETS_DIR", "BLENDER_AI_ASSETS_POLYHAVEN_API")}
+    real_usage = shutil.disk_usage
+    try:
+        os.environ["BLENDER_AI_ASSETS_DIR"] = str(ctx.work / "cache_r23")
+        os.environ["BLENDER_AI_ASSETS_POLYHAVEN_API"] = ctx.server.base + "/ph"
+        shutil.rmtree(ctx.work / "cache_r23", ignore_errors=True)
+        full = type("Usage", (), {"total": 1 << 40, "used": 1 << 40, "free": 50 << 20})()
+        assets.shutil.disk_usage = lambda path: full
+        n = ctx.server.count()
+        try:
+            assets.ph_fetch("fx_sky", None, "1k", None, False)
+            c("50 MB free: refused", False, "no error")
+        except assets.Fail as exc:
+            c("50 MB free on the cache disk: refused plainly", "free" in str(exc), exc)
+        c("... before any file request", not [r for r in ctx.server.since(n) if r["path"].startswith("/files/")])
+        assets.shutil.disk_usage = real_usage
+        dest = ctx.work / "r23_cap.bin"
+        if dest.exists():
+            dest.unlink()
+        try:
+            assets.download(ctx.server.base + "/files/fx_sky_1k.hdr", dest, max_bytes=50)
+            c("a file over its cap (unknown size): stopped", False, "no error")
+        except assets.Fail as exc:
+            c("a file over its cap (no size published): stopped while streaming, nothing kept", "more than" in str(exc)
+              and not dest.exists(), exc)
+        except TypeError as exc:
+            c("a file over its cap (no size published): stopped while streaming, nothing kept", False, exc)
+    finally:
+        assets.shutil.disk_usage = real_usage
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+@row("R24 slow servers: a trickled answer, a trickled file and a stalled body end with a plain reason")
+def r24(ctx, c):
+    assets = load_assets(ctx)
+    for name, value in (("JSON_SECONDS", 3), ("API_READ_TIMEOUT", 2), ("FILE_READ_TIMEOUT", 2), ("MIN_RATE", 1000),
+                        ("RATE_WINDOW", 2), ("HEADER_SECONDS", 3)):
+        setattr(assets, name, value)
+    base = ctx.server.base
+    done, box = in_thread(lambda: assets.http_json(base + "/ph/info/fx_sky", what="control"), 20)
+    c("control: a normal answer is read", done and isinstance(box.get("value"), dict), box)
+    for label, fn in (("headers at 4 bytes/s", lambda: assets.http_json(base + "/slow/headers", what="Poly Haven")),
+                      ("a JSON answer at 4 bytes/s", lambda: assets.http_json(base + "/slow/json", what="Poly Haven")),
+                      ("a body that stalls after its headers", lambda: assets.http_json(base + "/slow/stall", what="Poly Haven")),
+                      ("a file at 40 bytes/s", lambda: assets.download(base + "/slow/file", ctx.work / "r24.bin",
+                                                                       what="a slow file"))):
+        if (ctx.work / "r24.bin").exists():
+            (ctx.work / "r24.bin").unlink()
+        done, box = in_thread(fn, 25)
+        err = box.get("error")
+        c("%s: given up within 25 s with one plain reason" % label, done and isinstance(err, assets.Fail),
+          (done, box.get("seconds"), type(err).__name__ if err else None, err))
+    c("nothing of the slow file was kept", not (ctx.work / "r24.bin").exists())
+
+
+@row("R25 a texture onto an object in Edit Mode: done, Edit Mode back, the unsaved edit kept")
+def r25(ctx, c):
+    pre = ("import bmesh\nlayer = bpy.context.view_layer\nfloor = bpy.data.objects['Floor']\n"
+           "for o in layer.objects: o.select_set(False)\nfloor.select_set(True); layer.objects.active = floor\n"
+           "bpy.ops.object.mode_set(mode='EDIT')\nbm = bmesh.from_edit_mesh(floor.data); bm.verts.ensure_lookup_table()\n"
+           "bm.verts[0].co.z += 0.1; bmesh.update_edit_mesh(floor.data)\n"
+           "facts['z0'] = bm.verts[0].co.z; facts['mesh_z0'] = floor.data.vertices[0].co.z; facts['mode0'] = bpy.context.mode\n")
+    post = ("import bmesh\nfloor = bpy.data.objects['Floor']\nfacts['mode'] = bpy.context.mode\n"
+            "facts['editing'] = sorted(o.name for o in bpy.context.view_layer.objects if o.mode == 'EDIT')\n"
+            "if floor.mode == 'EDIT':\n    bm = bmesh.from_edit_mesh(floor.data); bm.verts.ensure_lookup_table(); facts['z1'] = bm.verts[0].co.z\n"
+            "facts['slot'] = floor.material_slots[0].material.name if floor.material_slots[0].material else None\n")
+    res = inblender(ctx, make_scene(ctx), dict(texture_job(apply_to=["Floor"]), _pre=pre, _post=post), "r25")
+    out, facts = res["result"], res["facts"]
+    c("control: Floor in Edit Mode with a vertex moved 0.1 that the mesh does not have yet",
+      facts.get("mode0") == "EDIT_MESH" and abs(facts.get("z0", 0) - facts.get("mesh_z0", 0) - 0.1) < 1e-6, facts)
+    c("the import is ok and the scene check passes", out.get("ok") and out.get("scene_check", {}).get("ok"),
+      out.get("error") or out.get("harness_error"))
+    c("Edit Mode is back on Floor alone", facts.get("mode") == "EDIT_MESH" and facts.get("editing") == ["Floor"], facts)
+    c("the unsaved edit is kept", abs(facts.get("z1", -9) - facts.get("z0", 0)) < 1e-6, facts)
+    c("Floor has the new material", facts.get("slot") == "fx_rock", facts.get("slot"))
+
+
+@row("R26 tiling is measured on the UV map renders use, and the material is wired to that map")
+def r26(ctx, c):
+    out = ctx.work / "r26.blend"
+    code, ans, err = ctx.headless("import", "polyhaven", "fx_rock", "--blend", make_scene2(ctx), "--save-as", out,
+                                  "--apply-to", "TwoUV")
+    c("import ok", code == 0, ans.get("error"))
+    if not out.exists():
+        return
+    after = probe(ctx, out)
+    tree = after["materials"][after["objects"]["TwoUV"]["slots"][0][1]]["tree"]
+    mapping = next(d for d in tree["nodes"].values() if d["type"] == "ShaderNodeMapping")
+    c("the render UV map (0-1 over 2 m) gives Mapping 2/1.8, not the edited map's 20/1.8",
+      all(abs(v - 2 / 1.8) < 1e-3 for v in mapping["scale"][:2]), mapping["scale"])
+    uvnodes = [n for n, d in tree["nodes"].items() if d["type"] == "ShaderNodeUVMap"]
+    c("a UV Map node names UVrender and feeds the Mapping", uvnodes and tree["nodes"][uvnodes[0]].get("uv_map") == "UVrender"
+      and feeds(tree, uvnodes[0], "ShaderNodeMapping", "Vector"), [tree["nodes"][n] for n in uvnodes])
+
+
+@row("R27 archive members Windows would rewrite or misplace are refused, and so are links and huge archives")
+def r27(ctx, c):
+    assets = load_assets(ctx)
+    folder = ctx.work / "r27"
+    shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir(parents=True)
+
+    def make(name, member, data=b"x" * 64, attr=None):
+        path = folder / name
+        with zipfile.ZipFile(path, "w") as z:
+            info = zipfile.ZipInfo(member)
+            if attr is not None:
+                info.external_attr = attr
+            z.writestr(info, data)
+        return path
+    good = make("good.zip", "a/ok.txt")
+    target = folder / "t_good"
+    names = assets.extract_zip(good, target)
+    c("control: a sound zip unpacks", names == ["a/ok.txt"] and (target / "a" / "ok.txt").is_file(), names)
+    cases = [("link.zip", "link_member", "symbolic link", 0o120777 << 16), ("dots.zip", "a/..../evil.txt", "dot", None),
+             ("space.zip", "a/b /evil.txt", "space", None), ("drive.zip", "C:evil.txt", "absolute", None),
+             ("unc.zip", "//server/share/evil.txt", "absolute", None), ("stream.zip", "a/b:evil.txt", "character", None),
+             ("device.zip", "a/con.txt", "device", None)]
+    for name, member, word, attr in cases:
+        archive = make(name, member, attr=attr)
+        target = folder / ("t_" + name)
+        try:
+            got = assets.extract_zip(archive, target)
+            c("%r: refused" % member, False, "extracted %s" % got)
+        except assets.Fail as exc:
+            left = [p for p in target.rglob("*")] if target.exists() else []
+            c("%r: refused plainly, nothing extracted" % member, word in str(exc) and not left, (str(exc), left))
+        except Exception as exc:  # noqa: BLE001
+            c("%r: refused plainly, nothing extracted" % member, False, "%s: %s" % (type(exc).__name__, exc))
+    saved = assets.MAX_UNPACKED
+    try:
+        assets.MAX_UNPACKED = 10
+        target = folder / "t_big"
+        try:
+            assets.extract_zip(good, target)
+            c("an archive over the unpack limit: refused", False, "extracted")
+        except assets.Fail as exc:
+            c("an archive over the unpack limit (lowered to 10 bytes here): refused, nothing extracted",
+              "would unpack" in str(exc) and not target.exists(), exc)
+    finally:
+        assets.MAX_UNPACKED = saved
+
+
+@row("R28 API answers in shapes the tool does not know: one plain reason, never a silent unchecked file")
+def r28(ctx, c):
+    cache = ctx.work / "cache_r28"
+    shutil.rmtree(cache, ignore_errors=True)
+    env = ctx.env(BLENDER_AI_ASSETS_POLYHAVEN_API=ctx.server.base + "/phx", BLENDER_AI_ASSETS_DIR=str(cache))
+    code, ans, err = ctx.tool("fetch", "polyhaven", "fx_sky2", env=env)
+    c("control: a normal asset through the same server works", code == 0, ans.get("error"))
+    for slug, words, label in (("x_type", "type", "the type given as a word"), ("x_url", "download address", "'url' renamed"),
+                               ("x_nomd5", "checksum", "no size or md5 (and a broken file served)")):
+        code, ans, err = ctx.tool("fetch", "polyhaven", slug, env=env)
+        error = ans.get("error", "")
+        c("%s: refused with a plain reason" % label, code == 1 and words in error and not error.startswith("unexpected"),
+          (code, error))
+        c("%s: nothing cached" % label, not list((cache / "polyhaven" / slug).glob("*/manifest.json")))
+    code, ans, err = ctx.tool("search", "--source", "polyhaven", "--type", "hdri", "renamed", env=env)
+    c("a search answer without 'results': an error, not an empty list", code == 1 and "result list" in ans.get("error", ""),
+      (code, ans.get("error"), ans.get("results")))
+    (cache / "polyhaven" / "fx_sky2" / "info.json").write_text("{}", encoding="utf-8")
+    code, ans, err = ctx.tool("fetch", "polyhaven", "fx_sky2", "--offline", env=env)
+    c("a damaged cached record, offline: the entry still answers from the cache", code == 0 and ans.get("cache") == "hit",
+      (code, ans.get("error")))
+    code, ans, err = ctx.tool("fetch", "polyhaven", "fx_sky2", env=env)
+    c("a damaged cached record, online: asked again and fine", code == 0, (code, ans.get("error")))
+    url = ctx.server.base + "/phx/assets?type=hdris"
+    store = cache / "_api" / (hashlib.sha1(url.encode("utf-8")).hexdigest()[:20] + ".json")
+    ctx.tool("search", "--source", "polyhaven", "--type", "hdri", env=env)
+    c("control: the asset list was cached where the row expects it", store.is_file(), store)
+    store.write_text("[1, 2, 3]", encoding="utf-8")
+    code, ans, err = ctx.tool("search", "--source", "polyhaven", "--type", "hdri", env=env)
+    c("a cached list in a wrong shape, online: fetched again", code == 0 and ans.get("results"), (code, ans.get("error")))
+    store.write_text("[1, 2, 3]", encoding="utf-8")
+    code, ans, err = ctx.tool("search", "--source", "polyhaven", "--type", "hdri", "--offline", env=env)
+    c("a cached list in a wrong shape, offline: a plain reason", code == 1 and not ans.get("error", "").startswith("unexpected"),
+      (code, ans.get("error")))
+
+
+@row("R29 damaged cache metadata and a full disk at the small writes: plain reasons, the listing survives")
+def r29(ctx, c):
+    cache = ctx.work / "cache_r29"
+    shutil.rmtree(cache, ignore_errors=True)
+    env = ctx.env(BLENDER_AI_ASSETS_DIR=str(cache))
+    code, ans, err = ctx.tool("fetch", "polyhaven", "fx_sky2", env=env)
+    c("control: an entry fetched", code == 0, ans.get("error"))
+    garbage = cache / "polyhaven" / "fx_garb" / "hdri-1k-hdr"
+    garbage.mkdir(parents=True)
+    (garbage / "manifest.json").write_text("garbage {", encoding="utf-8")
+    code, ans, err = ctx.tool("cache", env=env)
+    bad = [e for e in ans.get("entries", []) if e.get("id") == "fx_garb"]
+    c("`cache` with one garbage manifest: still lists, that entry marked damaged", code == 0 and bad and bad[0].get("problem")
+      and any(e.get("id") == "fx_sky2" for e in ans.get("entries", [])), (code, ans.get("error"), bad))
+    (cache / "polyhaven" / "fx_sky2" / "info.json").write_text("garbage {", encoding="utf-8")
+    code, ans, err = ctx.tool("fetch", "polyhaven", "fx_sky2", "--offline", env=env)
+    c("a garbage info.json beside a sound entry, offline: a cache hit", code == 0 and ans.get("cache") == "hit",
+      (code, ans.get("error")))
+    assets = load_assets(ctx)
+    saved = {k: os.environ.get(k) for k in ("BLENDER_AI_ASSETS_DIR", "BLENDER_AI_ASSETS_POLYHAVEN_API")}
+    real_write_text = pathlib.Path.write_text
+    for victim in ("manifest.json", "info.json"):
+        disk = ctx.work / ("cache_r29_" + victim.split(".")[0])
+        shutil.rmtree(disk, ignore_errors=True)
+        os.environ["BLENDER_AI_ASSETS_DIR"] = str(disk)
+        os.environ["BLENDER_AI_ASSETS_POLYHAVEN_API"] = ctx.server.base + "/ph"
+
+        def full_open(path, mode="r", *a, victim=victim, **kw):
+            if ("w" in mode or "x" in mode) and Path(str(path)).name.startswith(victim):
+                raise OSError(28, "No space left on device")
+            return builtins.open(path, mode, *a, **kw)
+
+        def full_write_text(self, *a, victim=victim, **kw):
+            if self.name.startswith(victim):
+                raise OSError(28, "No space left on device")
+            return real_write_text(self, *a, **kw)
+        assets.open = full_open
+        pathlib.Path.write_text = full_write_text
+        try:
+            assets.ph_fetch("fx_sky", None, "1k", None, False)
+            c("a full disk at %s: refused" % victim, False, "no error")
+        except assets.Fail as exc:
+            c("a full disk at %s: the plain 'disk full'" % victim, "disk full" in str(exc), exc)
+        except Exception as exc:  # noqa: BLE001
+            c("a full disk at %s: the plain 'disk full'" % victim, False, "%s: %s" % (type(exc).__name__, exc))
+        finally:
+            pathlib.Path.write_text = real_write_text
+            del assets.open
+        c("a full disk at %s: no cache entry" % victim, not list(disk.rglob("manifest.json")))
+    for k, v in saved.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
+@row("R30 a cache path of 260 characters or more: Blender still gets files it can open, or a plain reason")
+def r30(ctx, c):
+    long_cache = ctx.work / ("cache with a long folder name " + "x" * 170)
+    env = ctx.env(BLENDER_AI_ASSETS_DIR=str(long_cache))
+    out = ctx.work / "r30.blend"
+    code, ans, err = ctx.headless("import", "polyhaven", "fx_rock", "--blend", make_scene(ctx), "--save-as", out,
+                                  "--apply-to", "Floor", env=env)
+    files = (ans.get("fetch") or {}).get("files") or [str(p) for p in long_cache.rglob("*.jpg")]
+    c("control: the cached maps' paths are 260 characters or more", files and max(len(f) for f in files) >= 260,
+      max((len(f) for f in files), default=0))
+    shortable = bool(long_cache.exists() and (short_path(long_cache) or str(long_cache)) != str(long_cache))
+    error = ans.get("error", "")
+    c("the texture import works (here the folder has an 8.3 name: %s)" % shortable if shortable else
+      "no 8.3 names on this disk: the limit is said plainly", (code == 0) if shortable else
+      ("260" in error and "BLENDER_AI_ASSETS_DIR" in error), (code, error))
+    c("never the misleading 'No such file' or 'Please select a file'", "No such file" not in error
+      and "select a file" not in error, error)
+    code, ans, err = ctx.headless("import", "polyhaven", "fx_box", "--new", "--dry-run", env=env)
+    error = ans.get("error", "")
+    c("a glTF with its textures and buffer beside it, same cache: works (8.3 folders) or says the limit plainly",
+      (code == 0) if shortable else ("260" in error and "BLENDER_AI_ASSETS_DIR" in error), (code, error))
+    c("... and Blender read the glTF's buffer beside it (geometry measured)", code != 0 or
+      ans.get("import", {}).get("final_largest_m"), ans.get("import", {}).get("final_largest_m"))
+    deep = ctx.work / ("a skill installed in a deep folder " + "y" * 200) / "scripts"
+    deep.mkdir(parents=True, exist_ok=True)
+    for name in ("assets.py", "assets_blender.py", "bmcp.py"):
+        shutil.copyfile(ctx.scripts / name, deep / name)
+    proc = subprocess.run([sys.executable, "-X", "utf8", str(deep / "assets.py"), "import-file", str(ensure_kit(ctx) / "kit.glb"),
+                           "--new", "--dry-run"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          env=ctx.env(), timeout=600)
+    lines = [l for l in proc.stdout.splitlines() if l.strip()]
+    answer = json.loads(lines[-1]) if lines else {}
+    c("the tool itself in a folder of %d characters still starts its background Blender" % len(str(deep / "assets_blender.py")),
+      proc.returncode == 0 and answer.get("ok"), (proc.returncode, answer.get("error")))
+
+
+@row("R31 model extras: --pack packs a model's images; its own lights and cameras are left out unless asked")
+def r31(ctx, c):
+    kit = ensure_kit2(ctx)
+    c("control: the kit has an OBJ with an image texture beside it and a glTF with lights and a camera",
+      (kit / "tex.obj").is_file() and (kit / "tex.png").is_file() and (kit / "lights_cam.glb").is_file(), sorted(p.name for p in kit.iterdir()))
+    out = ctx.work / "r31a.blend"
+    code, ans, err = ctx.headless("import-file", kit / "tex.obj", "--new", "--save-as", out, "--pack")
+    after = probe(ctx, out) if out.exists() else {"images": {}}
+    imgs = {n: i for n, i in after["images"].items() if i["file"].endswith("tex.png")}
+    c("--pack: the OBJ's texture is packed into the saved file", code == 0 and imgs and all(i["packed"] for i in imgs.values()),
+      (ans.get("error"), imgs))
+    code, ans, err = ctx.headless("import-file", kit / "tex.obj", "--new", "--save-as", ctx.work / "r31b.blend")
+    c("without --pack: a warning says the scene reads files beside the model", code == 0
+      and any("--pack" in w for w in ans.get("import", {}).get("warnings") or []), ans.get("import", {}).get("warnings"))
+    out = ctx.work / "r31c.blend"
+    code, ans, err = ctx.headless("import-file", kit / "lights_cam.glb", "--new", "--save-as", out)
+    imp = ans.get("import", {})
+    after = probe(ctx, out) if out.exists() else {"objects": {}}
+    kinds = sorted(o["type"] for o in after["objects"].values() if imp.get("collection") in o["collections"])
+    c("default: the file's 3 lights and camera are left out, the cube comes in", code == 0 and kinds == ["MESH"], kinds)
+    c("... and a warning names what was left out", any("left out" in w for w in imp.get("warnings") or []), imp.get("warnings"))
+    out = ctx.work / "r31d.blend"
+    code, ans, err = ctx.headless("import-file", kit / "lights_cam.glb", "--new", "--save-as", out, "--keep-lights",
+                                  "--keep-cameras")
+    after = probe(ctx, out) if out.exists() else {"objects": {}}
+    kinds = sorted(o["type"] for o in after["objects"].values() if ans.get("import", {}).get("collection") in o["collections"])
+    c("--keep-lights --keep-cameras: they come in", code == 0 and kinds.count("LIGHT") == 3 and kinds.count("CAMERA") == 1, kinds)
+
+
+KIT2_SCRIPT = r'''
+import bpy, sys, os
+out = sys.argv[sys.argv.index("--") + 1]
+p = lambda n: os.path.join(out, n)
+bpy.ops.wm.read_homefile(use_empty=True)
+scene = bpy.context.scene
+bpy.ops.mesh.primitive_cube_add(size=1.0, location=(0, 0, 0.5)); bpy.context.object.name = "LitCube"
+for kind, loc in (("POINT", (0, 0, 3)), ("SUN", (2, 2, 5)), ("SPOT", (-2, 0, 3))):
+    ld = bpy.data.lights.new("L_" + kind, kind); ld.energy = 1000 if kind != "SUN" else 3
+    lo = bpy.data.objects.new("L_" + kind, ld); lo.location = loc; scene.collection.objects.link(lo)
+cam = bpy.data.objects.new("GltfCam", bpy.data.cameras.new("GltfCam")); cam.location = (5, -5, 3)
+scene.collection.objects.link(cam)
+bpy.ops.export_scene.gltf(filepath=p("lights_cam.glb"), export_format="GLB", export_lights=True, export_cameras=True)
+bpy.ops.wm.read_homefile(use_empty=True)
+img = bpy.data.images.new("tex", 8, 8)
+img.pixels[:] = [0.8, 0.2, 0.1, 1.0] * 64
+img.filepath_raw = p("tex.png"); img.file_format = "PNG"; img.save()
+bpy.ops.mesh.primitive_cube_add(size=0.5, location=(0, 0, 0.25)); cube = bpy.context.object; cube.name = "TexCube"
+m = bpy.data.materials.new("TexMat"); m.use_nodes = True
+t = m.node_tree.nodes.new("ShaderNodeTexImage"); t.image = bpy.data.images.load(p("tex.png"))
+bsdf = next(n for n in m.node_tree.nodes if n.bl_idname == "ShaderNodeBsdfPrincipled")
+m.node_tree.links.new(t.outputs["Color"], bsdf.inputs["Base Color"])
+cube.data.materials.append(m)
+bpy.ops.wm.obj_export(filepath=p("tex.obj"), path_mode="RELATIVE")
+open(p("done2"), "w").write("ok")
+'''
+
+
+def ensure_kit2(ctx):
+    kit = ctx.work / "kit2"
+    if not (kit / "done2").exists():
+        shutil.rmtree(kit, ignore_errors=True)
+        kit.mkdir(parents=True)
+        blender_run(ctx, None, KIT2_SCRIPT, "make_kit2.py", kit)
+    return kit
+
+
+TEXTS_PROBE = r'''
+import bpy, sys, json
+out = sys.argv[sys.argv.index("--") + 1]
+json.dump([[t.name, t.library.filepath if t.library else None, t.as_string()] for t in bpy.data.texts],
+          open(out, "w", encoding="utf-8"))
+'''
+
+LINK_SCRIPT = r'''
+import bpy, sys
+lib, out = sys.argv[sys.argv.index("--") + 1:][:2]
+with bpy.data.libraries.load(lib, link=True) as (src, dst):
+    dst.texts = ["ASSET_CREDITS"]
+bpy.context.scene["linked_credits"] = dst.texts[0]      # a user, or the save drops the link
+bpy.ops.wm.save_as_mainfile(filepath=out, copy=True)
+'''
+
+LIB_SCRIPT = r'''
+import bpy, sys
+out = sys.argv[sys.argv.index("--") + 1]
+bpy.ops.wm.read_homefile(use_empty=True)
+t = bpy.data.texts.new("ASSET_CREDITS"); t.from_string("a line kept in the library\n"); t.use_fake_user = True
+bpy.ops.wm.save_as_mainfile(filepath=out)
+'''
+
+
+def texts_of(ctx, blend):
+    out = ctx.work / "texts.json"
+    if out.exists():
+        out.unlink()
+    blender_run(ctx, blend, TEXTS_PROBE, "texts_probe.py", out)
+    return json.loads(out.read_text(encoding="utf-8")) if out.exists() else []
+
+
+@row("R32 credits: a local file is named without its folder; a linked ASSET_CREDITS does not swallow the line")
+def r32(ctx, c):
+    kit = ensure_kit(ctx)
+    out = ctx.work / "r32a.blend"
+    code, ans, err = ctx.headless("import-file", kit / "kit.glb", "--new", "--save-as", out)
+    line = ans.get("import", {}).get("credit", {}).get("line", "")
+    folder = str(kit).replace("\\", "/").lower()
+    c("control: the import is ok and has a credit line", code == 0 and "| file | kit.glb |" in line, (ans.get("error"), line))
+    c("the credit names no folder (no file:// URL, no user name)", "file:" not in line.lower()
+      and folder not in line.replace("\\", "/").lower() and str(Path.home()).replace("\\", "/").lower() not in
+      line.replace("\\", "/").lower(), line)
+    after = probe(ctx, out) if out.exists() else {"collections": {}}
+    custom = after["collections"].get(ans.get("import", {}).get("collection"), {}).get("custom", {})
+    c("nor do the collection's asset_* properties", custom and not any("file:" in str(v).lower()
+      or folder in str(v).replace("\\", "/").lower() for v in custom.values()), custom)
+    lib, linked = ctx.work / "credits_lib.blend", ctx.work / "scene_linked_credits.blend"
+    if not lib.exists():
+        blender_run(ctx, None, LIB_SCRIPT, "make_lib.py", lib)
+    if not linked.exists():
+        blender_run(ctx, make_scene(ctx), LINK_SCRIPT, "make_linked.py", lib, linked)
+    texts = texts_of(ctx, linked)
+    c("control: the scene's ASSET_CREDITS is linked from the library", any(t[0] == "ASSET_CREDITS" and t[1] for t in texts), texts)
+    out = ctx.work / "r32b.blend"
+    code, ans, err = ctx.headless("import", "polyhaven", "fx_sky", "--blend", linked, "--save-as", out)
+    texts = texts_of(ctx, out) if out.exists() else []
+    local = [t for t in texts if t[0].startswith("ASSET_CREDITS") and not t[1]]
+    c("after save and reopen, a local credits text holds the new line", code == 0 and local
+      and any("| fx_sky |" in t[2] for t in local), (ans.get("error"), texts))
+    code, ans, err = ctx.headless("credits", "--blend", out)
+    c("`credits` reads it back", code == 0 and any("| fx_sky |" in l for l in ans.get("credits") or []), ans)
+
+
+@row("R33 a downloaded glTF that points outside its own folder for an image is refused")
+def r33(ctx, c):
+    shutil.rmtree(ctx.cache / "sketchfab" / SF_ESCAPE, ignore_errors=True)
+    code, ans, err = ctx.tool("fetch", "sketchfab", SF_OK)
+    c("control: the sound Sketchfab zip is fetched", code == 0, ans.get("error"))
+    code, ans, err = ctx.tool("fetch", "sketchfab", SF_ESCAPE)
+    c("its image at ../../secret_outside.png: refused, says why", code == 1 and "outside" in ans.get("error", ""),
+      (code, ans.get("error")))
+    c("nothing cached", not list((ctx.cache / "sketchfab" / SF_ESCAPE).glob("*/manifest.json")))
+
+
+@row("R34 usage is settled before any work: --save-as or --dry-run, limits, --apply-to, the bridge; JSON and exit codes")
+def r34(ctx, c):
+    scene = make_scene(ctx)
+    shutil.rmtree(ctx.cache / "polyhaven" / "fx_sky", ignore_errors=True)
+    n = ctx.server.count()
+    code, ans, err = ctx.tool("import", "polyhaven", "fx_sky", "--blend", scene)
+    c("headless without --save-as: refused (exit 2) before any request", code == 2 and "--save-as" in ans.get("error", "")
+      and ctx.server.count() == n, (code, ans.get("error"), ctx.server.since(n)))
+    code, ans, err = ctx.headless("import", "polyhaven", "fx_sky", "--blend", scene, "--dry-run")
+    c("--dry-run: the import runs and the JSON says nothing was saved", code == 0 and ans.get("saved") is False,
+      (code, ans.get("error"), ans.get("saved")))
+    for limit in ("0", "-1"):
+        code, ans, err = ctx.tool("search", "--source", "polyhaven", "--limit", limit)
+        c("--limit %s: a bad argument" % limit, code == 2 and ans.get("code") == "bad_args", (code, ans.get("error")))
+    shutil.rmtree(ctx.cache / "polyhaven" / "fx_sky", ignore_errors=True)
+    n = ctx.server.count()
+    code, ans, err = ctx.tool("import", "polyhaven", "fx_sky", "--apply-to", "Floor", "--blend", scene, "--save-as",
+                              ctx.work / "r34.blend")
+    files = [r["path"] for r in ctx.server.since(n) if r["path"].startswith("/files/")]
+    c("--apply-to on an HDRI: refused (exit 2) before any file is downloaded", code == 2 and "--apply-to" in ans.get("error", "")
+      and not files, (code, ans.get("error"), files))
+    shutil.rmtree(ctx.cache / "polyhaven" / "fx_sky2", ignore_errors=True)
+    n = ctx.server.count()
+    code, ans, err = ctx.tool("import", "polyhaven", "fx_sky2", env=ctx.env(BLENDER_MCP_HOST="127.0.0.1", BLENDER_MCP_PORT="1"))
+    c("LIVE with no bridge: exit 4 before any request", code == 4 and ans.get("code") == "unreachable" and ctx.server.count() == n,
+      (code, ans.get("error"), ctx.server.since(n)))
+    code, ans, err = ctx.tool("import", "polyhaven")
+    c("an argparse error still prints one JSON line (bad_args, exit 2)", code == 2 and ans.get("code") == "bad_args"
+      and len([l for l in ctx.last_stdout.splitlines() if l.strip()]) == 1, (code, ctx.last_stdout[-200:]))
+    n = ctx.server.count()
+    code, ans, err = ctx.tool("search", "--source", "polypizza", "crate", env=ctx.env(POLYPIZZA_API_KEY=PP_KEY + "\r\nX-Evil: 1"))
+    c("a key with a line break: refused plainly before any request", code == 1 and "control character" in ans.get("error", "")
+      and ctx.server.count() == n, (code, ans.get("error")))
+    c("every failure says 'assets: FAILED (<code>): ...' on stderr", "assets: FAILED (failed):" in err, err[-200:])
+    scratch = ctx.work / "pyc_check"
+    shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir()
+    for name in ("assets.py", "assets_blender.py", "bmcp.py"):
+        shutil.copyfile(ctx.scripts / name, scratch / name)
+    env = ctx.env(BLENDER_MCP_HOST="127.0.0.1", BLENDER_MCP_PORT="1", PYTHONDONTWRITEBYTECODE=None)
+    subprocess.run([sys.executable, "-X", "utf8", str(scratch / "assets.py"), "import-file", str(ensure_kit(ctx) / "kit.glb")],
+                   capture_output=True, env=env, timeout=120)
+    c("a LIVE run (which loads bmcp.py) leaves no __pycache__ beside the scripts", not (scratch / "__pycache__").exists(),
+      sorted(p.name for p in scratch.iterdir()))
+
+
+@row("R35 texture slots and images: several slots need --slot; --slot N changes only N; a second import reuses the images")
+def r35(ctx, c):
+    scene = make_scene2(ctx)
+    before = probe(ctx, scene)
+    c("control: MultiSlot has MatA, MatB, MatC", [s[1] for s in before["objects"]["MultiSlot"]["slots"]] == ["MatA", "MatB", "MatC"],
+      before["objects"]["MultiSlot"]["slots"])
+    code, ans, err = ctx.headless("import", "polyhaven", "fx_rock", "--blend", scene, "--save-as", ctx.work / "r35a.blend",
+                                  "--apply-to", "MultiSlot")
+    c("no --slot on a 3-slot object: refused with the slots listed, scene unchanged", code == 1
+      and "0: MatA" in ans.get("error", "") and ans.get("import", {}).get("scene_unchanged") is True, (code, ans.get("error")))
+    out = ctx.work / "r35b.blend"
+    code, ans, err = ctx.headless("import", "polyhaven", "fx_rock", "--blend", scene, "--save-as", out, "--apply-to",
+                                  "MultiSlot", "--slot", "all")
+    after = probe(ctx, out) if out.exists() else {"objects": {"MultiSlot": {"slots": []}}}
+    c("--slot all: every slot", code == 0 and [s[1] for s in after["objects"]["MultiSlot"]["slots"]] == ["fx_rock"] * 3,
+      after["objects"]["MultiSlot"]["slots"])
+    out = ctx.work / "r35c.blend"
+    code, ans, err = ctx.headless("import", "polyhaven", "fx_rock", "--blend", scene, "--save-as", out, "--apply-to",
+                                  "MultiSlot", "--slot", "1")
+    after = probe(ctx, out) if out.exists() else {"objects": {"MultiSlot": {"slots": []}}}
+    prev = [a.get("previous") for a in ans.get("import", {}).get("applied", [])]
+    c("--slot 1: only slot 1 changes", code == 0 and [s[1] for s in after["objects"]["MultiSlot"]["slots"]]
+      == ["MatA", "fx_rock", "MatC"], after["objects"]["MultiSlot"]["slots"])
+    c("--slot 1: 'previous' lists only what was replaced", prev == [["MatB"]], prev)
+    one, two = ctx.work / "r35d.blend", ctx.work / "r35e.blend"
+    ctx.headless("import", "polyhaven", "fx_rock", "--blend", scene, "--save-as", one, "--apply-to", "Floor")
+    code, ans, err = ctx.headless("import", "polyhaven", "fx_rock", "--blend", one, "--save-as", two, "--apply-to", "TwoUV")
+    after = probe(ctx, two) if two.exists() else {"images": {}}
+    diffs = sorted(n for n, i in after["images"].items() if i["file"].endswith("fx_rock_diff_1k.jpg"))
+    c("a second import of the same texture reuses its images (one Diffuse image, not '.001')", code == 0 and len(diffs) == 1,
+      (ans.get("error"), diffs))
+    pre = "g['add_credit'] = lambda *a: (_ for _ in ()).throw(RuntimeError('planted failure after the slots were set'))\n"
+    post = "facts['slots'] = [[s.link, s.material.name if s.material else None] for s in bpy.data.objects['Floor'].material_slots]\n"
+    res = inblender(ctx, make_scene(ctx), dict(texture_job(apply_to=["Floor"]), _pre=pre, _post=post), "r35_rollback")
+    out, facts = res["result"], res["facts"]
+    c("a failure after the slots were set: Floor has FloorMat again, scene unchanged", out.get("ok") is False
+      and out.get("scene_unchanged") is True and facts.get("slots") == [["DATA", "FloorMat"]], (out.get("error"), facts))
+
+
+@row("R36 search --offline answers from the cached list, words included, however old the list is")
+def r36(ctx, c):
+    cache = ctx.work / "cache_r36"
+    shutil.rmtree(cache, ignore_errors=True)
+    env = ctx.env(BLENDER_AI_ASSETS_DIR=str(cache))
+    n = ctx.server.count()
+    code, ans, err = ctx.tool("search", "--source", "polyhaven", "--type", "hdri", "--offline", env=env)
+    c("control: nothing cached yet, offline: a plain reason and no request", code == 1 and ctx.server.count() == n
+      and not ans.get("error", "").startswith("unexpected"), (code, ans.get("error")))
+    code, ans, err = ctx.tool("search", "--source", "polyhaven", "--type", "hdri", "sky", env=env)
+    c("online search caches the list", code == 0, ans.get("error"))
+    for store in (cache / "_api").glob("*.json"):              # a list older than its 12 hours
+        data = json.loads(store.read_text(encoding="utf-8"))
+        data["fetched"] = 0
+        store.write_text(json.dumps(data), encoding="utf-8")
+    n = ctx.server.count()
+    code, ans, err = ctx.tool("search", "--source", "polyhaven", "--type", "hdri", "sky", "--offline", env=env)
+    ids = [r["id"] for r in ans.get("results", [])]
+    c("offline with words: keyword matches over the old cached list, said so, no request", code == 0
+      and {"fx_sky", "fx_sky2"} <= set(ids) and "keyword" in (ans.get("note") or "") and ctx.server.count() == n,
+      (code, ans.get("error"), ids, ans.get("note")))
 
 
 # ------------------------------------------------------------------------------------------- online rows
@@ -1267,6 +2338,7 @@ BRIDGE_BOOT_GUI = r'''
 import importlib.util, os, sys, bpy
 argv = sys.argv[sys.argv.index("--") + 1:]
 pkg, port = argv[0], int(argv[1])
+bpy.context.preferences.view.show_splash = False    # no splash over the screenshots; a sandbox profile, never saved
 name = "btools_bridge_mcp"
 spec = importlib.util.spec_from_file_location(name, os.path.join(pkg, "__init__.py"), submodule_search_locations=[pkg])
 module = importlib.util.module_from_spec(spec)
@@ -1369,6 +2441,101 @@ def g02(ctx, c):
     c("screenshot for the eye: %s" % shot, shot.is_file(), shot)
 
 
+LOCAL_VIEW = r'''
+import bpy
+win = bpy.context.window_manager.windows[0]
+area = max((a for a in win.screen.areas if a.type == "VIEW_3D"), key=lambda a: a.width * a.height)
+region = next(r for r in area.regions if r.type == "WINDOW")
+layer = bpy.context.view_layer
+if %r:
+    for o in layer.objects:
+        o.select_set(o.name == "Floor")
+with bpy.context.temp_override(window=win, area=area, region=region):
+    bpy.ops.view3d.localview()
+result = {"local": area.spaces.active.local_view is not None}
+'''
+
+
+@row("G03 GUI: a texture onto an object in Edit Mode (undo step, view unmoved); a model while Local View is on (windowed)")
+def g03(ctx, c):
+    if not ctx.gui:
+        c("needs --gui-port and --gui-pid", False, "skipped")
+        return
+    port, pid = ctx.gui["port"], ctx.gui["pid"]
+    env = ctx.env(BLENDER_MCP_HOST="127.0.0.1", BLENDER_MCP_PORT=port)
+    bridge_exec(port, EDIT_OFF)
+    v0 = bridge_exec(port, VIEW_SET)["views"]
+    e0 = bridge_exec(port, EDIT_ON)
+    c("control: Floor in Edit Mode with an unsaved edit", e0["mode"] == "EDIT_MESH", e0)
+    code, ans, err = ctx.tool("import", "polyhaven", "fx_rock", "--apply-to", "Floor", "--expect-pid", str(pid), env=env)
+    imp = ans.get("import", {})
+    c("texture import ok, scene check ok, one undo step", code == 0 and imp.get("scene_check", {}).get("ok")
+      and imp.get("undo_step") is True, (ans.get("error"), imp.get("undo_step")))
+    e1 = bridge_exec(port, EDIT_LOOK)
+    c("Edit Mode back on Floor, the unsaved edit kept", e1["mode"] == "EDIT_MESH" and e1["editing"] == e0["editing"]
+      and abs((e1["z"] or 0) - e0["z"]) < 1e-6, (e0, e1))
+    c("the 3D views did not move", bridge_exec(port, VIEW_LOOK)["views"] == v0)
+    bridge_exec(port, EDIT_OFF)
+    on = bridge_exec(port, LOCAL_VIEW % True)
+    c("control: the largest 3D view is in Local View on Floor", on.get("local") is True, on)
+    code, ans, err = ctx.tool("import", "polyhaven", "fx_box", "--size", "0.4", "--at", "2,2,0", "--expect-pid", str(pid), env=env)
+    warnings = ans.get("import", {}).get("warnings") or []
+    # Whether new objects join the Local View depends on the importer (a glTF duck did, this box does not): the
+    # warning must name exactly the new objects Blender says are outside it, and be absent when there are none.
+    member = bridge_exec(port, IN_LOCAL_VIEW % ans.get("import", {}).get("collection"))
+    outside = sorted(n for n, inside in (member.get("objects") or {}).items() if not inside)
+    said = [w for w in warnings if "Local View" in w]
+    c("a model imported during Local View: ok, and the warning names exactly what that view does not show",
+      code == 0 and bool(member.get("objects")) and (bool(said) == bool(outside))
+      and all(n in said[0] for n in outside[:5]), (ans.get("error"), said, member))
+    shot = ctx.work / "gui_local_view.png"
+    bridge_exec(port, SHOT % str(shot))
+    c("screenshot for the eye (Floor alone in Local View, the box not drawn): %s" % shot, shot.is_file(), shot)
+    bridge_exec(port, LOCAL_VIEW % False)
+
+
+IN_LOCAL_VIEW = r'''
+import bpy
+win = bpy.context.window_manager.windows[0]
+space = max((a for a in win.screen.areas if a.type == "VIEW_3D"), key=lambda a: a.width * a.height).spaces.active
+coll = bpy.data.collections.get(%r)
+result = {"objects": {o.name: bool(o.local_view_get(space)) for o in coll.all_objects} if coll else {}}
+'''
+
+
+PLAYBACK = r'''
+import bpy
+win = bpy.context.window_manager.windows[0]
+area = max((a for a in win.screen.areas if a.type == "VIEW_3D"), key=lambda a: a.width * a.height)
+region = next(r for r in area.regions if r.type == "WINDOW")
+with bpy.context.temp_override(window=win, area=area, region=region):
+    bpy.ops.screen.%s
+result = {"playing": win.screen.is_animation_playing, "materials": sorted(m.name for m in bpy.data.materials),
+          "floor": [s.material.name if s.material else None for s in bpy.data.objects["Floor"].material_slots]}
+'''
+
+
+@row("G04 GUI: an import while the timeline plays is refused and touches nothing (windowed Blender)")
+def g04(ctx, c):
+    # The whole import runs in one bridge tick, so two fingerprints taken back to back cannot see a playing
+    # timeline: this row is what showed that (the import went through), and it checks the refusal that replaced it.
+    if not ctx.gui:
+        c("needs --gui-port and --gui-pid", False, "skipped")
+        return
+    port, pid = ctx.gui["port"], ctx.gui["pid"]
+    env = ctx.env(BLENDER_MCP_HOST="127.0.0.1", BLENDER_MCP_PORT=port)
+    bridge_exec(port, EDIT_OFF)
+    on = bridge_exec(port, PLAYBACK % "animation_play()")
+    c("control: the timeline is playing", on.get("playing") is True, on)
+    code, ans, err = ctx.tool("import", "polyhaven", "fx_rock", "--apply-to", "Floor", "--expect-pid", str(pid), env=env)
+    off = bridge_exec(port, PLAYBACK % "animation_cancel(restore_frame=True)")
+    c("refused (exit 3), saying the timeline is playing", code == 3 and "timeline is playing" in (ans.get("error") or ""),
+      (code, ans.get("error")))
+    c("nothing touched: Floor's materials and the material list as before", off.get("floor") == on.get("floor")
+      and off.get("materials") == on.get("materials"), (on, off))
+    c("control: playback stopped again", off.get("playing") is False, off)
+
+
 def write_gui_boot(ctx, zip_path, port):
     if port in FORBIDDEN_PORTS:
         raise SystemExit("port %d is not ours" % port)
@@ -1386,7 +2553,7 @@ def write_gui_boot(ctx, zip_path, port):
     print('  set BLENDER_USER_CONFIG=%s & set BLENDER_USER_SCRIPTS=%s' % (config / "config", config / "scripts"))
     print('  "%s" --factory-startup "%s" --python "%s" -- "%s" %d' % (ctx.blender, gui_scene, boot, pkg, port))
     print("It prints BRIDGE_UP <port> <pid>. Then:")
-    print('  python -X utf8 "%s" --work "%s" --only G01,G02 --gui-port %d --gui-pid <pid>' % (Path(__file__).resolve(), ctx.work.parent, port))
+    print('  python -X utf8 "%s" --work "%s" --only G01,G02,G03,G04 --gui-port %d --gui-pid <pid>' % (Path(__file__).resolve(), ctx.work.parent, port))
 
 
 @row("O04 online + LIVE: one real import through the bridge")
@@ -1416,24 +2583,22 @@ MUTANTS = {
             ("assets.py", "    if size is not None and got != int(size):", "    if False:"),
             ("assets.py", "    if md5 and h_md5.hexdigest() != md5.lower():", "    if False:")],
     "R05": [("assets_blender.py", '    nt.links.new(background.outputs["Background"], output.inputs["Surface"])\n', "")],
-    "R06": [("assets_blender.py", '        image, space = _load_image(m["path"], m["role"] not in COLOR_ROLES, opts.get("pack"), made)',
-             '        image, space = _load_image(m["path"], False, opts.get("pack"), made)')],
+    "R06": [("assets_blender.py", '        image, space = _load_image(m["path"], m["role"] not in COLOR_ROLES, opts.get("pack"), made, snap, reused)',
+             '        image, space = _load_image(m["path"], False, opts.get("pack"), made, snap, reused)')],
     "R07": [("assets_blender.py", "            if role == \"normal_dx\":            # DirectX: green points the other way",
              "            if False:")],
     "R08": [("assets_blender.py", "    pivot = Vector(((lo.x + hi.x) / 2, (lo.y + hi.y) / 2, lo.z if ground else 0.0))",
              "    pivot = Vector(((lo.x + hi.x) / 2, (lo.y + hi.y) / 2, 0.0))")],
-    "R09": [("assets.py", '    if ".." in n.split("/"):\n        return "climbs out with \'..\'"', '    if False:\n        return ""'),
+    "R09": [("assets.py", '    if ".." in parts:\n        return "climbs out with \'..\'"', '    if False:\n        return ""'),
             ("assets.py", '    if n.startswith("/") or re.match(r"^[A-Za-z]:", n):\n        return "is an absolute path"', '    if False:\n        return ""'),
             ("assets.py", '    if real != real_target and not real.startswith(real_target + os.sep):\n        return "would land outside its folder"',
              '    if False:\n        return ""')],
-    "R10": [("assets.py", "        if _sha256(path) != item[\"sha256\"]:", "        if False:")],
+    "R10": [("assets.py", "        if _sha256(path) != item.get(\"sha256\"):", "        if False:")],
     "R11": [("assets.py", 'SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")', 'SLUG_RE = re.compile(r"^.{1,80}$")')],
     "R12": [("assets.py", "    return getattr(exc, \"errno\", None) in (errno.ENOSPC, getattr(errno, \"EDQUOT\", -1)) or \\",
              "    return False and \\")],
-    "R13": [("assets.py", '    key = os.environ.get("POLYPIZZA_API_KEY", "").strip()\n    if not key:',
-             '    key = os.environ.get("POLYPIZZA_API_KEY", "").strip()\n    if False:'),
-            ("assets.py", '    token = os.environ.get("SKETCHFAB_API_TOKEN", "").strip()\n    if not token:',
-             '    token = os.environ.get("SKETCHFAB_API_TOKEN", "").strip()\n    if False:')],
+    "R13": [("assets.py", '    value = os.environ.get(var, "")\n    if not value.strip():',
+             '    value = os.environ.get(var, "") or "x"\n    if False:')],
     "R14": [("assets.py", '[{"rel": meta["main"], "url": url, "check": "glb"}]',
              '[{"rel": meta["main"], "url": url, "check": "glb", "headers": {"x-auth-token": key}}]')],
     "R15": [("assets.py", '"author": rec["author"], "license": licence.get("label") or "unknown",',
@@ -1449,6 +2614,79 @@ MUTANTS = {
             ("assets_blender.py", "        for ob in layer.objects:\n            try:\n                ob.select_set(ob.as_pointer() in self.selected, view_layer=layer)",
              "        for ob in []:\n            try:\n                ob.select_set(ob.as_pointer() in self.selected, view_layer=layer)")],
 }
+
+# One planted defect per guard the breakers showed untested or broken (2026-10-22): (name, row, edits).
+GUARD_MUTANTS = [
+    ("R05-pack-hdri-ignored", "R05", [("assets_blender.py", '    image, _space = _load_image(job["files"]["main"], None, opts.get("pack"), made, snap)',
+                                       '    image, _space = _load_image(job["files"]["main"], None, False, made, snap)')]),
+    ("R11-https-only-off", "R11", [("assets.py", '    if parts.scheme == "https" or (parts.scheme == "http" and parts.hostname in LOCAL_HOSTS):',
+                                    '    if True:')]),
+    ("R14-key-sent-on-redirect", "R14", [("assets.py", "        req.add_unredirected_header(key, value)", "        req.add_header(key, value)")]),
+    ("R15-glb-length-check-off", "R15", [("assets.py", '            if item.get("check") == "glb":\n                check_glb(dest)',
+                                          '            if False:\n                check_glb(dest)')]),
+    ("R17-save-as-by-spelling", "R17", [("assets.py", "            if blend and _same_path(save, blend):",
+                                         "            if blend and str(save) == str(blend):")]),
+    ("R20-only-id-collections", "R20", [("assets_blender.py", "            muted = _mute_scripted_drivers(ids_new_since(before_ids))",
+                                         "            muted = _mute_scripted_drivers(snap.all_new())"),
+                                        ("assets_blender.py", '    keys = getattr(block, "shape_keys", None)\n    if keys is not None:',
+                                         '    keys = None\n    if keys is not None:')]),
+    ("R20-no-node-trees", "R20", [("assets_blender.py", '    tree = getattr(block, "node_tree", None)\n    if tree is not None and getattr(tree, "is_embedded_data", False):',
+                                   '    tree = None\n    if tree is not None and getattr(tree, "is_embedded_data", False):')]),
+    ("R21-nan-accepted", "R21", [("assets.py", '    if not math.isfinite(value):\n        raise Fail("%s must be a real number',
+                                  '    if False:\n        raise Fail("%s must be a real number')]),
+    ("R21-fingerprint-nan", "R21", [("assets_blender.py", "        if not math.isfinite(value):          # NaN != NaN",
+                                     "        if False:          # NaN != NaN")]),
+    ("R22-unit-scale-ignored", "R22", [("assets_blender.py", '    s = float(units.scale_length) if units.system != "NONE" else 1.0',
+                                        "    s = 1.0")]),
+    ("R23-size-limit-off", "R23", [("assets.py", '    if total > LIMIT_BYTES:\n        raise Fail("%s is %s to download',
+                                    '    if False:\n        raise Fail("%s is %s to download')]),
+    ("R24-deadlines-off", "R24", [("assets.py", "            if time.monotonic() - start > seconds:", "            if False:"),
+                                  ("assets.py", "                    if rate < MIN_RATE:", "                    if False:")]),
+    ("R24-header-deadline-off", "R24", [("assets.py", "    worker.join(HEADER_SECONDS)\n    if worker.is_alive():",
+                                         "    worker.join()\n    if worker.is_alive():")]),
+    ("R25-edit-mode-kept", "R25", [("assets_blender.py", "    if targets:\n        # Edit Mode keeps", "    if False:\n        # Edit Mode keeps")]),
+    ("R26-edit-uv-map", "R26", [("assets_blender.py", "    return next((layer for layer in me.uv_layers if layer.active_render), None) or me.uv_layers.active",
+                                 "    return me.uv_layers.active")]),
+    ("R27-symlink-check-off", "R27", [("assets.py", "                if problem is None and ((info.external_attr >> 16) & 0o170000) == 0o120000:",
+                                       "                if False:")]),
+    ("R27-unpack-limit-off", "R27", [("assets.py", "            if total > MAX_UNPACKED:", "            if False:")]),
+    ("R27-windows-names-off", "R27", [("assets.py", '        if part != part.rstrip(". "):', "        if False:"),
+                                      ("assets.py", "        if re.search(r'[<>:\"|?*\\x00-\\x1f]', part):", "        if False:")]),
+    ("R28-checksums-optional", "R28", [("assets.py", "    if not isinstance(size, int) or isinstance(size, bool) or size < 0 or \\\n"
+                                                     "            not isinstance(md5, str) or not re.match(r\"^[0-9a-fA-F]{32}$\", md5):",
+                                        "    if False:")]),
+    ("R29-cache-listing-unguarded", "R29", [("assets.py", "            except (OSError, ValueError) as exc:\n                manifest, damaged = None, \"its manifest cannot be read (%s)\" % exc",
+                                             "            except KeyError as exc:\n                manifest, damaged = None, \"its manifest cannot be read (%s)\" % exc")]),
+    ("R29-small-writes-unguarded", "R29", [("assets.py", '        if _disk_full(exc):\n            raise Fail("disk full while writing %s; nothing was kept" % path) from None\n'
+                                                         '        raise Fail("could not write %s: %s" % (path, exc)) from None',
+                                            "        raise")]),
+    ("R30-long-path-passed-on", "R30", [("assets.py", "    if os.name != \"nt\" or max(len(f) for f in files) < WIN_MAX_PATH:\n        return main",
+                                         "    return main")]),
+    ("R31-pack-ignored-for-models", "R31", [("assets_blender.py", '    if opts.get("pack"):\n        for image in images:',
+                                             '    if False:\n        for image in images:')]),
+    ("R31-lights-kept", "R31", [("assets_blender.py", "        if keep:\n            continue\n        if ob.children:",
+                                 "        if True:\n            continue\n        if ob.children:")]),
+    ("R32-local-path-in-credit", "R32", [("assets.py", '"page_url": "local file, sha256 %s" % digest[:16]}', '"page_url": path.as_uri()}')]),
+    ("R32-linked-credits-written", "R32", [("assets_blender.py", '        if text.library is None and getattr(text, "override_library", None) is None:\n            local = local or text',
+                                            "        if True:\n            local = local or text")]),
+    ("R33-gltf-uris-unchecked", "R33", [("assets.py", '            refuse_gltf_escape(partial / meta["main"], "the model\'s glTF")', "            pass")]),
+    ("R34-save-as-optional", "R34", [("assets.py", '        elif keeps_result and not getattr(args, "dry_run", False):', "        elif False:")]),
+    ("R34-bridge-asked-late", "R34", [("assets.py", '    who, where = live_ping(args)\n    return {"mode": "live"',
+                                       '    who, where = {}, "?"\n    return {"mode": "live"')]),
+    ("R35-multi-slot-replaced", "R35", [("assets_blender.py", "        if slot is None and count > 1:", "        if False:")]),
+    ("R35-slot-rollback-noop", "R35", [("assets_blender.py", '            rollback.add(undo)\n            expected.add("objects:" + ob.name)',
+                                        '            expected.add("objects:" + ob.name)')]),
+    ("R35-images-loaded-again", "R35", [("assets_blender.py", "    image = bpy.data.images.load(path, check_existing=snap is not None)",
+                                         "    image = bpy.data.images.load(path, check_existing=False)")]),
+    ("R36-offline-words-refused", "R36", [("assets.py", "    if query and OFFLINE:\n        ranked = ph_keyword_match(query, assets)",
+                                           "    if False:\n        ranked = ph_keyword_match(query, assets)")]),
+    ("R36-offline-ignored-by-list-cache", "R36", [("assets.py", '    if entry is not None and (OFFLINE or time.time() - entry.get("fetched", 0) < API_TTL):',
+                                                   '    if entry is not None and (time.time() - entry.get("fetched", 0) < API_TTL):')]),
+]
+
+
+def all_mutants():
+    return [(code, code, edits) for code, edits in MUTANTS.items()] + GUARD_MUTANTS
 
 
 def apply_mutant(src_dir, dst_dir, edits):
@@ -1494,14 +2732,18 @@ def main():
     parser.add_argument("--gui-port", type=int, help="G rows: a windowed Blender serving the bridge on this spare port")
     parser.add_argument("--gui-pid", type=int, help="G rows: that Blender's process id (it is checked)")
     parser.add_argument("--write-gui-boot", action="store_true", help="prepare the windowed run (needs --bridge-zip, --gui-port)")
-    parser.add_argument("--only", default="")
+    parser.add_argument("--only", default="", help="rows (R05,R20) or mutant names to run")
+    parser.add_argument("--scripts", help="the folder of the assets.py / assets_blender.py / bmcp.py to test "
+                                          "(default: this skill's scripts)")
     args = parser.parse_args()
     work = Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
     selected = {s.strip() for s in args.only.split(",") if s.strip()}
+    scripts = Path(args.scripts).resolve() if args.scripts else SKILL / "scripts"
     server = FixtureServer(FIXTURES)
-    summary = {"rows": [], "mutants": []}
-    ctx = Ctx(args, SKILL / "scripts", work / "main")
+    summary = {"rows": [], "mutants": [], "scripts": str(scripts)}
+    ctx = Ctx(args, scripts, work / "main")
+    os.environ["BTOOLS_TRAP_ROOT"] = str(ctx.work)      # the driver traps' marker folders (make_trap), for every Blender
     ctx.server = server
     bridge = None
     if args.write_gui_boot:
@@ -1518,7 +2760,7 @@ def main():
             ctx.bridge = bridge
             print("bridge up on %d, pid %d" % (bridge["port"], bridge["pid"]), flush=True)
         if args.online:
-            online = Ctx(args, SKILL / "scripts", work / "main")
+            online = Ctx(args, scripts, work / "main")
             online.cache = work / "cache_online"
             online.bridge = bridge
             online.server = None
@@ -1527,23 +2769,29 @@ def main():
         if ctx.gui:
             summary["rows"] += run_rows(ctx, lambda code: code.startswith("G") and (not selected or code in selected))
         if args.mutants:
-            for code, edits in MUTANTS.items():
-                if selected and code not in selected:
+            for number, (name, code, edits) in enumerate(all_mutants()):
+                if selected and code not in selected and name not in selected:
                     continue
-                mdir = work / "mutants" / code
-                apply_mutant(SKILL / "scripts", mdir / "scripts", edits)
+                mdir = work / "mutants" / ("m%02d" % number)        # short: Blender opens nothing of 260+ characters
+                apply_mutant(scripts, mdir / "scripts", edits)
                 mctx = Ctx(args, mdir / "scripts", mdir)
                 mctx.server = server
                 mctx.bridge = bridge
                 if bridge is not None and code == "R18":
                     print("(R18's mutant runs against the same bridge Blender)", flush=True)
-                print("MUTANT %s: %s" % (code, "; ".join(old[:50].strip() for _n, old, _new in edits)), flush=True)
+                print("MUTANT %s (row %s): %s" % (name, code, "; ".join(old[:50].strip() for _n, old, _new in edits)), flush=True)
                 res = run_rows(mctx, lambda c, code=code: c == code)
                 failed = bool(res) and not res[0]["ok"]
-                summary["mutants"].append({"row": code, "planted": [old[:80] for _n, old, _new in edits],
-                                           "row_failed_as_it_must": failed,
-                                           "failing_checks": [c["check"] for c in (res[0]["checks"] if res else []) if not c["ok"]]})
-                print("  => mutant %s: %s" % (code, "CAUGHT (row failed)" if failed else "NOT CAUGHT (row passed)"), flush=True)
+                failing = [c for c in (res[0]["checks"] if res else []) if not c["ok"]]
+                # A Blender that could not even start is not the planted defect being noticed: say so.
+                harness = [c["check"] for c in failing if "without a result" in c["detail"] or "row ran to the end" in c["check"]]
+                summary["mutants"].append({"mutant": name, "dir": mdir.name, "row": code,
+                                           "planted": [old[:80] for _n, old, _new in edits],
+                                           "row_failed_as_it_must": failed and len(harness) < len(failing),
+                                           "failing_checks": [c["check"] for c in failing], "harness_failures": harness})
+                print("  => mutant %s: %s%s" % (name, "CAUGHT (row failed)" if failed else "NOT CAUGHT (row passed)",
+                                                " - but %d check(s) failed because the harness did: %s" % (len(harness), harness)
+                                                if harness else ""), flush=True)
     finally:
         if bridge is not None:
             bridge["proc"].terminate()

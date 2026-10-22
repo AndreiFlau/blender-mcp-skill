@@ -142,32 +142,38 @@ in the live session unless the user asked.
 
 ## Seeing the scene, and bringing assets in
 
-Two command-line tools beside `bmcp.py`, for scene building and add-on work alike. Both
-reach the running Blender through the bridge (LIVE, the default; `--expect-file` /
-`--expect-pid` refuse a Blender that is not the one meant) or run a background Blender
-on a file (`--blend FILE`, `--new`). Both print one JSON line and put back everything they
-do not own, checked by a fingerprint of the session before and after. `--help` on each
-has every option and example.
+Two tools beside `bmcp.py`, for scene building and add-on work alike. Each prints one JSON
+line (read its `warnings`), runs LIVE through the bridge or HEADLESS (`--blend FILE`,
+`--new`), never saves, and checks with a fingerprint that the session is put back (exit 5).
 
-- `scripts/look.py`: pictures of the scene as one labelled sheet plus each view.
-  `--mode angles --target Chair --views front,right,top,three_quarter`,
-  `--mode camera --shading rendered`, `--mode frames --frame-count 8 --center-bones hips`,
-  `--mode viewport` (what the user sees), `--mode ui --ui sidebar:MyAddon` (an add-on's
-  panel, LIVE only); `--shading solid|material|rendered|wireframe|xray`.
-- `scripts/assets.py`: `search` / `fetch` / `import` from Poly Haven (free, no key), Poly
-  Pizza (`POLYPIZZA_API_KEY`) and Sketchfab (`SKETCHFAB_API_TOKEN`): an HDRI becomes a
-  world, a texture a material at real-world size, a model its own collection at `--size`
-  metres on the ground. `import-file` does the same for a local glb/fbx/obj/usd/blend (test
-  fixtures). Credits go into the `ASSET_CREDITS` text; the cache is `BLENDER_AI_ASSETS_DIR`.
+- `scripts/look.py`: the scene as pictures, a labelled sheet plus each view. Use it whenever
+  numbers cannot say a result looks right: a model, a material, a rig, an animation.
+- `scripts/assets.py`: HDRIs, textures and models from Poly Haven, Poly Pizza, Sketchfab or a
+  file, put in the scene at real size and credited in the `ASSET_CREDITS` text.
 
-Status (2026-10-19): built and self-tested headless and through a bridge on a spare port;
-not yet attacked by a breaker; the windowed paths (`viewport`, `ui`, LIVE import in a GUI
-session) are untested until `tests/look_gui_check.py` and `tests/test_assets.py --only
-G01,G02` run in a windowed Blender. Tests: `tests/test_look.py`, `tests/test_assets.py`.
-Portions adapted from MCP for Blender (MIT): see `THIRD_PARTY_NOTICES.md`.
+```
+python <this-skill-dir>/scripts/look.py --expect-pid N --mode angles --target Chair
+python <this-skill-dir>/scripts/look.py --blend scene.blend --mode frames --frame-count 8 --view front --target Rig --center-bones hips
+python <this-skill-dir>/scripts/assets.py search --source polyhaven --type texture rock wall --limit 5
+python <this-skill-dir>/scripts/assets.py import polyhaven rock_wall_08 --apply-to Floor --expect-pid N
+```
+
+Live, always pass `--expect-pid N` from a `bmcp.py` identity query. `--mode viewport` and
+`--mode ui` need a windowed Blender. A look pauses frame-change handlers (`--run-handlers`
+lets an add-on's run). A headless import needs `--save-as`. Tiling is set at import from the
+object's size: size it first. All modes and options, safety checks, failures, a bridge on a
+spare port and the tests: [look-and-assets.md](references/look-and-assets.md).
+
+Status (2026-10-22): attacked by two breakers and a first-time user, then mended; self-tests
+pass headless, through a 1.0.3 bridge and in a windowed Blender (`tests/look_gui_check.py`,
+`tests/test_assets.py --only G01,G02,G03,G04`). In a window a look pauses Blender for each
+tick (0.4-0.7 s on 3000 objects). Adapted code from MCP for Blender (MIT):
+`THIRD_PARTY_NOTICES.md`.
 
 ## Focused workflows
 
+- Pictures of the scene, and assets brought into it (look.py, assets.py):
+  [look-and-assets.md](references/look-and-assets.md).
 - Paint canvas, shader layers, dirty image packing and UV/API traps:
   [painting-and-materials.md](references/painting-and-materials.md).
 - Native render thread boundaries, ID retirement, demand-driven caches and 5.2

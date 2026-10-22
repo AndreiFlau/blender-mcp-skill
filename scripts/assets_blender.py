@@ -52,6 +52,8 @@ def _r(value, digits=6):
     if isinstance(value, bool) or value is None or isinstance(value, (int, str)):
         return value
     if isinstance(value, float):
+        if not math.isfinite(value):          # NaN != NaN: as a float it would make every look differ
+            return "nan" if value != value else ("inf" if value > 0 else "-inf")
         return round(value, digits) + 0.0
     if isinstance(value, bpy.types.ID):
         return "ID:" + value.name
@@ -63,6 +65,13 @@ def _r(value, digits=6):
 
 def _digest(data):
     return hashlib.sha1(json.dumps(data, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def _key(block):
+    """A datablock's key in the fingerprint: its name, plus its library for linked data (a local and a linked
+    datablock may share a name)."""
+    lib = getattr(block, "library", None)
+    return block.name if lib is None else "%s [%s]" % (block.name, lib.filepath)
 
 
 def _socket_value(sock):
@@ -181,32 +190,32 @@ def fingerprint():
         for block in getattr(bpy.data, attr, ()):
             fp["ids"]["%s:%x" % (attr, block.as_pointer())] = {"name": block.name}
     for ob in bpy.data.objects:
-        fp["objects"][ob.name] = _object_print(ob, layer)
+        fp["objects"][_key(ob)] = _object_print(ob, layer)
     for me in bpy.data.meshes:
-        fp["meshes"][me.name] = _mesh_print(me)
+        fp["meshes"][_key(me)] = _mesh_print(me)
     for mat in bpy.data.materials:
-        fp["materials"][mat.name] = {"fake_user": mat.use_fake_user, "tree": _tree(mat.node_tree),
-                                     "diffuse": _r(mat.diffuse_color)}
+        fp["materials"][_key(mat)] = {"fake_user": mat.use_fake_user, "tree": _tree(mat.node_tree),
+                                      "diffuse": _r(mat.diffuse_color)}
     for world in bpy.data.worlds:
-        fp["worlds"][world.name] = {"fake_user": world.use_fake_user, "tree": _tree(world.node_tree),
-                                    "color": _r(world.color)}
+        fp["worlds"][_key(world)] = {"fake_user": world.use_fake_user, "tree": _tree(world.node_tree),
+                                     "color": _r(world.color)}
     for image in bpy.data.images:
-        fp["images"][image.name] = {"file": image.filepath, "source": image.source,
-                                    "packed": image.packed_file is not None,
-                                    "colorspace": image.colorspace_settings.name, "alpha": image.alpha_mode,
-                                    "fake_user": image.use_fake_user}
+        fp["images"][_key(image)] = {"file": image.filepath, "source": image.source,
+                                     "packed": image.packed_file is not None,
+                                     "colorspace": image.colorspace_settings.name, "alpha": image.alpha_mode,
+                                     "fake_user": image.use_fake_user}
     for coll in bpy.data.collections:
-        fp["collections"][coll.name] = {"objects": sorted(o.name for o in coll.objects),
-                                        "children": sorted(c.name for c in coll.children),
-                                        "hide": [coll.hide_viewport, coll.hide_render, coll.hide_select]}
+        fp["collections"][_key(coll)] = {"objects": sorted(o.name for o in coll.objects),
+                                         "children": sorted(c.name for c in coll.children),
+                                         "hide": [coll.hide_viewport, coll.hide_render, coll.hide_select]}
     for text in bpy.data.texts:
-        fp["texts"][text.name] = {"content": hashlib.sha1(text.as_string().encode("utf-8")).hexdigest()[:16]}
+        fp["texts"][_key(text)] = {"content": hashlib.sha1(text.as_string().encode("utf-8")).hexdigest()[:16]}
     for group in bpy.data.node_groups:
-        fp["node_groups"][group.name] = {"tree": _tree(group)}
+        fp["node_groups"][_key(group)] = {"tree": _tree(group)}
     for light in bpy.data.lights:
-        fp["lights"][light.name] = {"v": [light.type, _r(light.energy), _r(light.color)]}
+        fp["lights"][_key(light)] = {"v": [light.type, _r(light.energy), _r(light.color)]}
     for cam in bpy.data.cameras:
-        fp["cameras"][cam.name] = {"v": [cam.type, _r(cam.lens), _r(cam.clip_start), _r(cam.clip_end)]}
+        fp["cameras"][_key(cam)] = {"v": [cam.type, _r(cam.lens), _r(cam.clip_start), _r(cam.clip_end)]}
     render = scene.render
     view = scene.view_settings
     units = scene.unit_settings
@@ -470,8 +479,26 @@ def _set_colorspace(image, data):
     return image.colorspace_settings.name
 
 
-def _load_image(path, data, pack, made):
-    image = bpy.data.images.load(path, check_existing=False)
+def _fits(image, data, pack):
+    """May an image that is already loaded from this file serve again, untouched (same colour space role,
+    packed when packing is asked, not edited in memory)?"""
+    if image.source != "FILE" or image.is_dirty or (pack and image.packed_file is None):
+        return False
+    if data is None:
+        return True
+    return bool(getattr(image.colorspace_settings, "is_data", False)) == bool(data)
+
+
+def _load_image(path, data, pack, made, snap=None, reused=None):
+    """The image for a cache file. One already loaded from the same file is used again when it fits (no
+    '.001' copy per import); the user's own image is never changed to make it fit."""
+    image = bpy.data.images.load(path, check_existing=snap is not None)
+    if snap is not None and (not snap.is_new(image, "images") or image.name in made):
+        if _fits(image, data, pack):
+            if reused is not None and image.name not in reused and image.name not in made:
+                reused.append(image.name)
+            return image, image.colorspace_settings.name
+        image = bpy.data.images.load(path, check_existing=False)
     made.append(image.name)
     space = _set_colorspace(image, data) if data is not None else image.colorspace_settings.name
     if pack:
@@ -501,10 +528,28 @@ def credit_line(meta):
     return " | ".join(str(f).replace("|", "/").replace("\n", " ") for f in fields)
 
 
+def _credit_texts():
+    """(the local ASSET_CREDITS text or None, the linked ones). A linked text cannot keep a line: a save drops it."""
+    local, linked = None, []
+    for text in bpy.data.texts:
+        if text.name != CREDITS_TEXT:
+            continue
+        if text.library is None and getattr(text, "override_library", None) is None:
+            local = local or text
+        else:
+            linked.append(text)
+    return local, linked
+
+
 def add_credit(meta, rollback):
-    text = bpy.data.texts.get(CREDITS_TEXT)
+    text, linked = _credit_texts()
+    note = None
     if text is None:
         text = bpy.data.texts.new(CREDITS_TEXT)       # new: removed with the other new datablocks on failure
+        if linked:
+            note = ("this file's %s is linked from %s, where a line would be lost when the file is saved; the "
+                    "credit went into a local text named %r" % (CREDITS_TEXT, linked[0].library.filepath
+                                                                if linked[0].library else "a library", text.name))
     else:
         old = text.as_string()
         rollback.add(lambda: text.from_string(old))
@@ -513,21 +558,74 @@ def add_credit(meta, rollback):
     if current and not current.endswith("\n"):
         current += "\n"
     text.from_string(current + line + "\n")
-    return {"text": text.name, "line": line}
+    out = {"text": text.name, "line": line}
+    if note:
+        out["note"] = note
+    return out
+
+
+def _id_collection_names():
+    """Every bpy.data collection that holds datablocks (shape keys, line styles and the rest included)."""
+    names = []
+    for prop in bpy.data.bl_rna.properties:
+        if prop.type != "COLLECTION":
+            continue
+        fixed = getattr(prop, "fixed_type", None)
+        cls = getattr(bpy.types, fixed.identifier, None) if fixed is not None else None
+        if isinstance(cls, type) and issubclass(cls, bpy.types.ID):
+            names.append(prop.identifier)
+    return names
+
+
+def all_id_pointers():
+    return {b.as_pointer() for attr in _id_collection_names() for b in getattr(bpy.data, attr, ())}
+
+
+def ids_new_since(pointers):
+    return [b for attr in _id_collection_names() for b in getattr(bpy.data, attr, ()) if b.as_pointer() not in pointers]
+
+
+def _driver_owners(block):
+    """The datablock and what carries drivers along with it: its own node tree and its shape keys."""
+    owners = [(block.name, block)]
+    tree = getattr(block, "node_tree", None)
+    if tree is not None and getattr(tree, "is_embedded_data", False):
+        owners.append(("%s (node tree)" % block.name, tree))
+    keys = getattr(block, "shape_keys", None)
+    if keys is not None:
+        owners.append(("%s (shape keys)" % block.name, keys))
+    return owners
+
+
+def _python_drivers(blocks):
+    """Drivers that would run Python (not Blender's own simple-expression evaluator)."""
+    seen = set()
+    for block in blocks:
+        for label, owner in _driver_owners(block):
+            anim = getattr(owner, "animation_data", None)
+            if anim is None:
+                continue
+            for fc in anim.drivers:
+                drv = fc.driver
+                if drv.type == "SCRIPTED" and not drv.is_simple_expression and fc.as_pointer() not in seen:
+                    seen.add(fc.as_pointer())
+                    yield label, fc
 
 
 def _mute_scripted_drivers(blocks):
-    """Drivers that would run Python (not Blender's simple-expression evaluator) in data we brought in."""
+    """Mute every Python driver in data we brought in, BEFORE anything is evaluated, then prove none is left:
+    in a Blender that runs scripts (Auto Run on) an evaluation would run them."""
     muted = []
-    for block in blocks:
-        anim = getattr(block, "animation_data", None)
-        if anim is None:
-            continue
-        for fc in anim.drivers:
-            drv = fc.driver
-            if drv.type == "SCRIPTED" and not drv.is_simple_expression:
-                fc.mute = True
-                muted.append("%s: %s = %s" % (block.name, fc.data_path, drv.expression[:80]))
+    for label, fc in list(_python_drivers(blocks)):
+        try:
+            fc.mute = True
+        except (AttributeError, RuntimeError, TypeError):
+            pass                                        # linked data: found below and refused
+        muted.append("%s: %s = %s" % (label, fc.data_path, fc.driver.expression[:80]))
+    left = ["%s: %s" % (label, fc.data_path) for label, fc in _python_drivers(blocks) if not fc.mute]
+    if left:
+        raise Refuse("the .blend carries drivers that would run Python and could not be muted (%s); nothing was "
+                     "kept" % "; ".join(left[:5]))
     return muted
 
 
@@ -570,11 +668,30 @@ def measure(objects):
             "size": [float(v) for v in (hi - lo)], "vertices": count}
 
 
+def unit_scale():
+    """Metres per Blender unit in this scene (Unit Scale; 0.01 in a centimetre scene). With no unit system the
+    numbers are plain Blender units, taken as metres."""
+    units = bpy.context.scene.unit_settings
+    s = float(units.scale_length) if units.system != "NONE" else 1.0
+    return s if math.isfinite(s) and s > 0 else 1.0
+
+
+def render_uv(me):
+    """The UV map renders use (active_render), which is not always the one being edited (active)."""
+    return next((layer for layer in me.uv_layers if layer.active_render), None) or me.uv_layers.active
+
+
 def uv_metres(ob):
-    """Metres of surface per UV unit on this mesh (world space), or None without a UV map."""
+    """(Blender units of surface per UV unit on this mesh in world space, the UV map's name), or (None, None)
+    without a UV map. Measured on the render UV map, the one the material is wired to."""
     me = ob.data
-    if ob.type != "MESH" or me is None or me.uv_layers.active is None or not len(me.polygons):
-        return None
+    layer = render_uv(me) if ob.type == "MESH" and me is not None else None
+    if layer is None or not len(me.polygons):
+        return None, None
+    return _uv_area_ratio(ob, me, layer), layer.name
+
+
+def _uv_area_ratio(ob, me, layer):
     me.calc_loop_triangles()
     tris = len(me.loop_triangles)
     if not tris:
@@ -589,7 +706,7 @@ def uv_metres(ob):
     m = np.array(ob.matrix_world, dtype=np.float64)
     co = co @ m[:3, :3].T + m[:3, 3]
     uv = np.empty(len(me.loops) * 2, np.float32)
-    me.uv_layers.active.data.foreach_get("uv", uv)
+    layer.data.foreach_get("uv", uv)
     uv = uv.reshape(-1, 2).astype(np.float64)
     p = co[verts].reshape(-1, 3, 3)
     t = uv[loops].reshape(-1, 3, 2)
@@ -603,11 +720,11 @@ def uv_metres(ob):
 
 # --------------------------------------------------------------------------------------------- HDRI
 
-def import_hdri(job, rollback, expected):
+def import_hdri(job, rollback, expected, snap):
     meta, opts = job["meta"], job["options"]
     scene = bpy.context.scene
     made = []
-    image, _space = _load_image(job["files"]["main"], None, opts.get("pack"), made)
+    image, _space = _load_image(job["files"]["main"], None, opts.get("pack"), made, snap)
     wanted = opts.get("name") or meta.get("id") or "HDRI"
     world = bpy.data.worlds.new(wanted)
     if not world.use_nodes:          # always on in 5.x, where setting it is deprecated
@@ -648,7 +765,7 @@ def import_hdri(job, rollback, expected):
     report = {"world": world.name, "image": image.name, "image_file": image.filepath,
               "strength": background.inputs["Strength"].default_value, "rotation_deg": rotation,
               "previous_world": kept, "replaced_world": bool(opts.get("replace_world")),
-              "packed": bool(opts.get("pack"))}
+              "packed": image.packed_file is not None, "image_reused": image.name not in made}
     if old is not None and opts.get("replace_world"):
         report["note"] = ("the previous world %r is no longer used; Blender drops it when the file is saved "
                           "unless something else uses it" % old.name)
@@ -663,7 +780,7 @@ ROLE_INPUTS = {"base_color": ("Base Color",), "roughness": ("Roughness",), "meta
 COLOR_ROLES = {"base_color", "emission"}
 
 
-def build_material(name, maps, images, scale, box, disp_scale, meta, made):
+def build_material(name, maps, images, scale, box, disp_scale, meta, made, uv_name=None):
     mat = bpy.data.materials.new(name)
     made.append(mat.name)
     if not mat.use_nodes:
@@ -675,13 +792,20 @@ def build_material(name, maps, images, scale, box, disp_scale, meta, made):
     bsdf = nt.nodes.new("ShaderNodeBsdfPrincipled")
     bsdf.location = (350, 0)
     nt.links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
-    coord = nt.nodes.new("ShaderNodeTexCoord")
-    coord.location = (-1300, 0)
     mapping = nt.nodes.new("ShaderNodeMapping")
     mapping.location = (-1100, 0)
     # POINT: Scale multiplies the coordinate, so the pattern repeats Scale times per coordinate unit.
     mapping.vector_type = "POINT"
-    nt.links.new(coord.outputs["Object" if box else "UV"], mapping.inputs["Vector"])
+    if not box and uv_name:
+        # The UV map the tiling was measured on, named: the same one the render uses.
+        coord = nt.nodes.new("ShaderNodeUVMap")
+        coord.uv_map = uv_name
+        coord.location = (-1300, 0)
+        nt.links.new(coord.outputs["UV"], mapping.inputs["Vector"])
+    else:
+        coord = nt.nodes.new("ShaderNodeTexCoord")
+        coord.location = (-1300, 0)
+        nt.links.new(coord.outputs["Object" if box else "UV"], mapping.inputs["Vector"])
     mapping.inputs["Scale"].default_value = scale
     y = 500
     have = {m["role"] for m in maps}
@@ -769,7 +893,7 @@ def _wiring(mat):
     return found
 
 
-def import_texture(job, rollback, expected):
+def import_texture(job, state, snap, rollback, expected, patch_before):
     meta, opts, files = job["meta"], job["options"], job["files"]
     maps = files["maps"]
     if not maps:
@@ -782,40 +906,55 @@ def import_texture(job, rollback, expected):
         if not hasattr(ob.data, "materials"):
             raise Refuse("%r is a %s, which cannot take a material" % (name, ob.type))
         targets.append(ob)
-    slot = opts.get("slot")
+    slot = opts.get("slot")                 # None: not given; "all"; or one slot number
     for ob in targets:
         sharing = [o.name for o in bpy.data.objects if o.data is ob.data and o not in targets]
-        if slot is not None and slot >= len(ob.material_slots):
-            raise Refuse("%r has %d material slot(s); there is no slot %d" % (ob.name, len(ob.material_slots), slot))
+        count = len(ob.material_slots)
+        if isinstance(slot, int) and slot >= count:
+            raise Refuse("%r has %d material slot(s); there is no slot %d" % (ob.name, count, slot))
+        if slot is None and count > 1:
+            listing = ", ".join("%d: %s" % (i, s.material.name if s.material else "(empty)")
+                                for i, s in enumerate(ob.material_slots))
+            raise Refuse("%r has %d material slots (%s); say which with --slot N, or --slot all to put the "
+                         "material in every one" % (ob.name, count, listing))
         if not ob.material_slots and sharing:
             raise Refuse("%r has no material slot and shares its mesh with %s: adding a slot would change them "
                          "too. Give it a slot first, or name them as well" % (ob.name, ", ".join(sharing)))
-    made = []
+    if targets:
+        # Edit Mode keeps a mesh's UVs in its own copy (the mesh's are empty meanwhile): leave it, so the edit is
+        # written back, the UV map can be measured and the slots set; the mode is entered again at the end.
+        synced = state.leave_mode()
+        if synced:
+            patch_before(synced)
+    made, reused = [], []
     images, spaces = {}, {}
     for m in maps:
-        image, space = _load_image(m["path"], m["role"] not in COLOR_ROLES, opts.get("pack"), made)
+        image, space = _load_image(m["path"], m["role"] not in COLOR_ROLES, opts.get("pack"), made, snap, reused)
         images[m["path"]] = image
         spaces[m["key"]] = space
+    metres_per_bu = unit_scale()
     dims = meta.get("dimensions_m") or None
     size_w, size_h = (float(dims[0]), float(dims[1])) if dims else (1.0, 1.0)
     disp_scale = meta.get("displacement_scale") or 0.01
+    disp_bu = disp_scale / metres_per_bu
     wanted = opts.get("name") or meta.get("id") or "material"
     plans = []
     if not targets:
-        plans.append({"objects": [], "box": False, "scale": (1.0 / size_w, 1.0 / size_h, 1.0),
+        plans.append({"objects": [], "box": False, "uv": None, "scale": (1.0 / size_w, 1.0 / size_h, 1.0),
                       "how": "no object given: assumes 1 UV unit = 1 m"})
     for ob in targets:
-        per_uv = uv_metres(ob)
+        per_uv, uv_name = uv_metres(ob)
         if per_uv is not None:
-            plan = {"box": False, "scale": (per_uv / size_w, per_uv / size_h, 1.0),
-                    "how": "UV map: %.4g m of surface per UV unit" % per_uv}
+            metres = per_uv * metres_per_bu
+            plan = {"box": False, "uv": uv_name, "scale": (metres / size_w, metres / size_h, 1.0),
+                    "how": "UV map %r: %.4g m of surface per UV unit" % (uv_name, metres)}
         else:
-            s = ob.matrix_world.to_scale()
-            plan = {"box": True, "scale": (s.x / size_w, s.y / size_w, s.z / size_w),
+            s = ob.matrix_world.to_scale() * metres_per_bu
+            plan = {"box": True, "uv": None, "scale": (s.x / size_w, s.y / size_w, s.z / size_w),
                     "how": "no UV map: box projection on object coordinates"}
         for existing in plans:
-            if existing["box"] == plan["box"] and existing.get("objects") is not None and all(
-                    abs(a - b) <= 0.02 * max(abs(b), 1e-9) for a, b in zip(existing["scale"], plan["scale"])):
+            if existing["box"] == plan["box"] and existing["uv"] == plan["uv"] and existing.get("objects") is not None \
+                    and all(abs(a - b) <= 0.02 * max(abs(b), 1e-9) for a, b in zip(existing["scale"], plan["scale"])):
                 existing["objects"].append(ob)
                 break
         else:
@@ -824,11 +963,11 @@ def import_texture(job, rollback, expected):
     materials = []
     for i, plan in enumerate(plans):
         name = wanted if i == 0 else "%s (%s)" % (wanted, plan["objects"][0].name)
-        mat = build_material(name, maps, images, plan["scale"], plan["box"], disp_scale, meta, made)
+        mat = build_material(name, maps, images, plan["scale"], plan["box"], disp_bu, meta, made, plan["uv"])
         plan["material"] = mat
         materials.append({"material": mat.name, "objects": [o.name for o in plan["objects"]],
                           "mapping_scale": [round(v, 6) for v in plan["scale"]], "tiling": plan["how"],
-                          "wiring": _wiring(mat)})
+                          "uv_map": plan["uv"], "wiring": _wiring(mat)})
     applied = []
     for plan in plans:
         mat = plan["material"]
@@ -850,11 +989,12 @@ def import_texture(job, rollback, expected):
             expected.add("objects:" + ob.name)
             data_key = "%s:%s" % ("meshes" if ob.type == "MESH" else "other", ob.data.name)
             note = None
+            indices = []
             if not ob.material_slots:
                 ob.data.materials.append(mat)
                 expected.add(data_key)
             else:
-                indices = range(len(ob.material_slots)) if slot is None else [slot]
+                indices = list(range(len(ob.material_slots))) if slot in (None, "all") else [slot]
                 for i in indices:
                     s = ob.material_slots[i]
                     if s.link == "DATA" and sharing:
@@ -865,8 +1005,8 @@ def import_texture(job, rollback, expected):
                         expected.add(data_key)        # the mesh holds this slot's material
                     s.material = mat
             applied.append({"object": ob.name, "material": mat.name,
-                            "previous": [m.name if m else None for _l, m in before],
-                            "slots": "all" if slot is None else [slot], "note": note})
+                            "previous": [before[i][1].name if before[i][1] else None for i in indices],
+                            "slots": "all" if slot in (None, "all") else [slot], "note": note})
     # A material nothing uses any more would be dropped when the file is saved: keep the user's with a fake user.
     kept = []
     for item in applied:
@@ -879,12 +1019,15 @@ def import_texture(job, rollback, expected):
                 rollback.add(lambda old=old: setattr(old, "use_fake_user", False))
     skipped = meta.get("skipped_maps") or []
     report = {"materials": materials, "applied": applied, "skipped_maps": skipped, "colorspaces": spaces,
-              "previous_materials_kept": kept,
-              "displacement": {"scale_m": disp_scale, "midlevel": 0.5,
+              "previous_materials_kept": kept, "images_reused": reused, "unit_scale": metres_per_bu,
+              "displacement": {"scale_m": disp_scale, "scale_bu": disp_bu, "midlevel": 0.5,
                                "how": "wired to the Material Output as Blender's default (bump only); for true "
                                       "displacement set the material's displacement method to Displacement and "
                                       "subdivide the mesh"} if any(m["role"] == "displacement" for m in maps) else None,
-              "real_size_m": [size_w, size_h] if dims else None, "packed": bool(opts.get("pack"))}
+              "real_size_m": [size_w, size_h] if dims else None,
+              "packed": all(images[m["path"]].packed_file is not None for m in maps)}
+    if metres_per_bu != 1.0:
+        report["units"] = "this scene's Unit Scale is %g m per Blender unit; metre sizes were converted" % metres_per_bu
     if not targets:
         report["note"] = ("nothing uses the material yet; Blender drops unused materials when the file is saved. "
                           "Pass --apply-to to put it on objects")
@@ -984,7 +1127,10 @@ def import_model(job, state, snap, rollback, expected, patch_before):
     world_before = scene.world
     try:
         if path.lower().endswith(".blend"):
+            before_ids = all_id_pointers()
             colls, objs, how = _append_blend(path, opts.get("picks"), opts.get("prefer_collections"))
+            # Before anything links or evaluates it: mute every Python driver it brought, wherever it sits.
+            muted = _mute_scripted_drivers(ids_new_since(before_ids))
             for c in colls:
                 if not any(c.name in p.children for p in [coll]):
                     coll.children.link(c)
@@ -992,7 +1138,6 @@ def import_model(job, state, snap, rollback, expected, patch_before):
                 if not ob.users_collection:
                     coll.objects.link(ob)
             texts = [t.name for t in snap.new("texts")]
-            muted = _mute_scripted_drivers(snap.all_new())
         else:
             _run_importer(path)
     finally:
@@ -1001,12 +1146,34 @@ def import_model(job, state, snap, rollback, expected, patch_before):
         scene.world = world_before
         warnings.append("the file brought its own world; the scene's world was put back")
     new_colls = _gather(coll, snap)
+    dropped, kept_extra = [], []
+    for ob in list(snap.new("objects")):
+        keep = opts.get("keep_lights") if ob.type == "LIGHT" else opts.get("keep_cameras") if ob.type == "CAMERA" else True
+        if keep:
+            continue
+        if ob.children:
+            kept_extra.append("%s %r (other objects hang under it)" % (ob.type.lower(), ob.name))
+            continue
+        data, kind = ob.data, ob.type
+        dropped.append("%s %r" % (kind.lower(), ob.name))
+        bpy.data.objects.remove(ob)
+        if data is not None and data.users == 0:
+            (bpy.data.lights if kind == "LIGHT" else bpy.data.cameras).remove(data)
+    if dropped:
+        warnings.append("the file brought %s; left out so they do not light or film your scene "
+                        "(--keep-lights / --keep-cameras keep them)" % ", ".join(dropped))
+    if kept_extra:
+        warnings.append("kept %s; it now lights or films your scene" % ", ".join(kept_extra))
     new_objs = snap.new("objects")
     if not new_objs:
-        raise Refuse("the file brought no objects")
+        raise Refuse("the file brought no objects" + (" but lights or cameras (%s); --keep-lights / --keep-cameras "
+                                                      "keep them" % ", ".join(dropped) if dropped else ""))
     authored = measure(new_objs)
+    metres_per_bu = unit_scale()
     size = opts.get("size")
-    at = Vector(opts.get("at") or (0.0, 0.0, 0.0))
+    size_bu = float(size) / metres_per_bu if size else None
+    at_m = [float(v) for v in (opts.get("at") or (0.0, 0.0, 0.0))]
+    at = Vector(at_m) / metres_per_bu
     ground = opts.get("ground", True)
     rot = math.radians(float(opts.get("rotate") or 0.0))
     if authored is None:
@@ -1018,7 +1185,7 @@ def import_model(job, state, snap, rollback, expected, patch_before):
     else:
         lo, hi = Vector(authored["min"]), Vector(authored["max"])
     largest = max(hi - lo) if authored else 0.0
-    factor = (float(size) / largest) if (size and largest > 0) else 1.0
+    factor = (size_bu / largest) if (size_bu and largest > 0) else 1.0
     pivot = Vector(((lo.x + hi.x) / 2, (lo.y + hi.y) / 2, lo.z if ground else 0.0))
     place = Matrix.Translation(at) @ Matrix.Rotation(rot, 4, "Z") @ Matrix.Scale(factor, 4) @ Matrix.Translation(-pivot)
     roots = [o for o in new_objs if o.parent is None]
@@ -1038,20 +1205,55 @@ def import_model(job, state, snap, rollback, expected, patch_before):
         for root in roots:
             root.matrix_world = place @ root.matrix_world
     final = measure(new_objs) if authored else None
+    # Whether new objects join a Local View depends on how the importer made them (the glTF duck did, the .blend box
+    # did not): say what is so, per view, instead of guessing.
+    left_out = set()
+    for window in getattr(bpy.context.window_manager, "windows", []):
+        for area in window.screen.areas:
+            space = area.spaces.active if area.type == "VIEW_3D" else None
+            if space is not None and space.local_view is not None:
+                left_out.update(o.name for o in new_objs + ([holder] if holder else []) if not o.local_view_get(space))
+    if left_out:
+        names = sorted(left_out)
+        warnings.append("a 3D view is in Local View and %s %s not part of it, so that view does not show %s until "
+                        "Local View is left" % (", ".join(names[:5]) + (" and %d more" % (len(names) - 5)
+                                                                         if len(names) > 5 else ""),
+                                                "is" if len(names) == 1 else "are", "it" if len(names) == 1 else "them"))
+    images = [i for i in snap.new("images") if i.packed_file is None and i.source in ("FILE", "SEQUENCE", "TILED")
+              and i.filepath]
+    packed = []
+    if opts.get("pack"):
+        for image in images:
+            try:
+                image.pack()
+                packed.append(image.name)
+            except RuntimeError as exc:
+                warnings.append("could not pack the image %r: %s" % (image.name, str(exc).strip().splitlines()[-1]))
+    elif images:
+        warnings.append("%d image(s) are read from the files beside the model (%s); the scene needs that folder - "
+                        "--pack keeps them inside the .blend" % (len(images), os.path.dirname(path)))
     report = {"collection": coll.name, "collections_inside": [c.name for c in new_colls],
               "objects": sorted(o.name for o in new_objs), "roots": sorted(o.name for o in roots),
               "authored": authored, "final": final, "scale_applied": factor, "size_requested": size,
-              "at": list(at), "grounded": bool(ground), "rotate_deg": float(opts.get("rotate") or 0.0),
-              "placement_empty": holder.name if holder else None, "how": how,
-              "scripted_drivers_muted": muted, "texts_brought": texts, "warnings": warnings}
+              "at": at_m, "at_bu": list(at), "grounded": bool(ground), "rotate_deg": float(opts.get("rotate") or 0.0),
+              "placement_empty": holder.name if holder else None, "how": how, "unit_scale": metres_per_bu,
+              "scripted_drivers_muted": muted, "texts_brought": texts, "left_out": dropped,
+              "packed_images": packed, "warnings": warnings}
+    if metres_per_bu != 1.0:
+        report["units"] = ("this scene's Unit Scale is %g m per Blender unit: --size and --at were converted; "
+                           "'authored' and 'final' are in Blender units" % metres_per_bu)
     if final:
         report["final_lowest_z"] = final["min"][2]
-        report["final_largest_m"] = max(final["size"])
+        report["final_lowest_z_m"] = final["min"][2] * metres_per_bu
+        report["final_largest_bu"] = max(final["size"])
+        report["final_largest_m"] = max(final["size"]) * metres_per_bu
         report["final_centre_xy"] = [(final["min"][0] + final["max"][0]) / 2, (final["min"][1] + final["max"][1]) / 2]
     published = meta.get("dimensions_m")
     if published and authored and len(published) == 3:
         report["published_size_m"] = published
-        a, b = sorted(authored["size"]), sorted(float(v) for v in published)
+        a = sorted(v * metres_per_bu for v in authored["size"])
+        b = sorted(float(v) for v in published)
+        report["authored_size_m"] = a
         report["authored_matches_published"] = all(abs(x - y) <= 0.01 * max(y, 1e-6) for x, y in zip(a, b))
     return report
 
@@ -1062,10 +1264,15 @@ def _check_identity(job):
     want_file = job.get("expect_file")
     if want_file is not None:
         have = bpy.data.filepath
-        if os.path.dirname(want_file):
-            same = have and os.path.normcase(os.path.abspath(have)) == os.path.normcase(os.path.abspath(want_file))
+        if not have:
+            same = False
+        elif os.path.dirname(want_file):
+            try:
+                same = os.path.samefile(have, want_file)      # 8.3 names, case and links name the same file
+            except OSError:
+                same = os.path.normcase(os.path.realpath(have)) == os.path.normcase(os.path.realpath(want_file))
         else:
-            same = os.path.basename(have) == want_file
+            same = os.path.normcase(os.path.basename(have)) == os.path.normcase(want_file)
         if not same:
             raise Refuse("WRONG BLENDER, nothing was touched: it has %r open, not %r" % (have or "(unsaved)", want_file))
     want_pid = job.get("expect_pid")
@@ -1083,20 +1290,28 @@ def run_job(job):
     try:
         _check_identity(job)
     except Refuse as exc:
-        return {"ok": False, "error": str(exc), "blender": who, "touched": False}
+        return {"ok": False, "code": "refused", "error": str(exc), "blender": who, "touched": False}
     op = job.get("op")
     if op == "credits":
-        text = bpy.data.texts.get(CREDITS_TEXT)
-        return {"ok": True, "blender": who, "credits": text.as_string().splitlines() if text else []}
+        text, linked = _credit_texts()
+        out = {"ok": True, "blender": who, "credits": text.as_string().splitlines() if text else []}
+        if linked:
+            out["linked_credits"] = {(t.library.filepath if t.library else "?"): t.as_string().splitlines() for t in linked}
+        return out
     if op == "selftest_fingerprint":
         return selftest_fingerprint(job)
+    # The whole job runs in one bridge tick, so a playing timeline cannot show up between two fingerprints: ask.
+    wm = bpy.context.window_manager
+    if wm is not None and any(w.screen is not None and w.screen.is_animation_playing for w in wm.windows):
+        return {"ok": False, "code": "refused", "blender": who, "touched": False,
+                "error": "the timeline is playing: stop it (Esc) and import again. Nothing was touched"}
     first = fingerprint()
     second = fingerprint()
     control = diff_fingerprints(first, second)
     if control:
-        return {"ok": False, "blender": who, "touched": False,
-                "error": "the scene changes by itself between two looks (%s); is an animation playing or a timer "
-                         "writing? Nothing was touched" % "; ".join(control[:5])}
+        return {"ok": False, "code": "refused", "blender": who, "touched": False,
+                "error": "the scene changes by itself between two looks (%s): a driver or handler that gives a new "
+                         "value each time? Nothing was touched" % "; ".join(control[:5])}
     state = SceneState()
     snap = IdSnapshot()
     rollback = Rollback()
@@ -1112,9 +1327,9 @@ def run_job(job):
     try:
         kind = job.get("kind")
         if kind == "hdri":
-            report = import_hdri(job, rollback, expected)
+            report = import_hdri(job, rollback, expected, snap)
         elif kind == "texture":
-            report = import_texture(job, rollback, expected)
+            report = import_texture(job, state, snap, rollback, expected, patch_before)
         elif kind == "model":
             report = import_model(job, state, snap, rollback, expected, patch_before)
         else:
@@ -1146,13 +1361,15 @@ def run_job(job):
              "settings_put_back": put_back, "ok": not left}
     out = {"blender": who, "scene_check": check}
     if error is not None:
-        out.update({"ok": False, "error": error, "scene_unchanged": not left})
+        out.update({"ok": False, "code": "failed" if not left else "left_changed", "error": error,
+                    "scene_unchanged": not left})
         if tb:
             out["traceback"] = tb
         return out
     out.update(report)
     out["ok"] = not left
     if left:
+        out["code"] = "left_changed"
         out["error"] = "BLENDER WAS LEFT CHANGED outside what the import does: " + "; ".join(left[:8])
     if undo_step is not None:
         out["undo_step"] = undo_step
@@ -1253,8 +1470,16 @@ def _main_headless():
         result = run_job(job)
         if result.get("ok") and job.get("save_as"):
             target = os.path.abspath(job["save_as"])
-            if bpy.data.filepath and os.path.normcase(target) == os.path.normcase(os.path.abspath(bpy.data.filepath)):
-                result = {"ok": False, "error": "refusing to save over the input file %s" % target}
+            have = bpy.data.filepath
+            same = False
+            if have:
+                try:
+                    same = os.path.exists(target) and os.path.samefile(target, have)
+                except OSError:
+                    same = False
+                same = same or os.path.normcase(os.path.realpath(target)) == os.path.normcase(os.path.realpath(have))
+            if same:
+                result = {"ok": False, "code": "refused", "error": "refusing to save over the input file %s" % target}
             else:
                 bpy.context.preferences.filepaths.save_version = 0      # no PATH.blend1 beside it (factory prefs, not saved)
                 bpy.ops.wm.save_as_mainfile(filepath=target, copy=True, check_existing=False)

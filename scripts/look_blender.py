@@ -22,19 +22,29 @@ emulated with numpy; the result's "warnings" say what differs.
 
 Before anything is changed a fingerprint of the session is taken (render, display and EEVEE
 settings, every view layer and collection flag, every object's visibility, selection,
-transforms and animated values, every 3D view's shading, overlays and view matrices, the
-editors and their tabs, the frame, the mode, the active object, and the name of every
+transforms, display settings and animated values, every 3D view's shading, overlays, view
+matrices and local view, the editors and their tabs, the frame, the mode, the active object,
+the 3D cursor and tool settings, the contents of cameras, lights, armatures, materials,
+worlds, meshes, images and texts, custom properties, and the name and identity of every
 datablock in every bpy.data collection), and it is taken again at the end. A difference fails
-the run with the list of what changed.
+the run with the list of what changed. It is a check of those things, not of everything.
+
+While a look works, the session's frame-change, depsgraph-update and render handlers are
+paused (an add-on that records or sends every change sees none of the temporary ones);
+--run-handlers lets them run.
 """
 
+import contextlib
+import io
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import time
 import traceback
+import unicodedata
 import zlib
 import struct
 
@@ -63,7 +73,15 @@ CLUTTER = ("show_floor", "show_ortho_grid", "show_axis_x", "show_axis_y", "show_
            "show_camera_guides", "show_light_colors", "show_look_dev", "show_face_orientation",
            "show_onion_skins", "show_fade_inactive", "show_performance", "show_statvis")
 MAX_FIT_POINTS = 400000          # per object, for framing only
+MAX_FIT_INSTANCES = 200000       # instances sampled evenly over all of them, for framing only
 MAX_TILES = 24
+TINY_PX = 3.0                    # a framed target smaller than this in a tile is said by name
+HANDLER_LISTS = ("frame_change_pre", "frame_change_post", "depsgraph_update_pre", "depsgraph_update_post",
+                 "render_init", "render_pre", "render_post", "render_stats", "render_write", "render_complete",
+                 "render_cancel")
+MAX_HASHED_VERTICES = 1000000    # fingerprint: mesh coordinates are hashed up to this many vertices in all
+UI_NEXT_STEP = ("To see an add-on's panel, serve the bridge from a Blender with a window (tests/look_gui_check.py in "
+                "this skill shows how), or test the panel's draw() headless (the blender-headless-qa skill).")
 
 
 class LookError(Exception):
@@ -86,6 +104,22 @@ def long_path(path):
         if len(full) >= 240 and not full.startswith(prefix):
             return prefix + full
     return path
+
+
+def same_file(a, b):
+    """True when the two paths name the same file or folder, however they are spelled (8.3 short names, letter
+    case, '..', links). Compares the files themselves when both exist, the resolved paths otherwise."""
+    if not a or not b:
+        return False
+    try:
+        if os.path.exists(a) and os.path.exists(b):
+            return os.path.samefile(a, b)
+    except OSError:
+        pass
+    try:
+        return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+    except OSError:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
 def write_png(path, img):
@@ -277,11 +311,31 @@ for _line in _GLYPHS.strip().splitlines():
     FONT[_char] = np.array([[c == "#" for c in row] for row in _rows], bool)
 
 
+def plain_label(text):
+    """`text` as the 5 x 7 font can draw it: upper case, accents dropped (Ação -> ACAO), and any other letter it
+    has no glyph for shown as '*' (the JSON keeps every name exactly)."""
+    out = []
+    for char in unicodedata.normalize("NFKD", str(text)):
+        if unicodedata.combining(char):
+            continue
+        up = char.upper()
+        out.append(up if len(up) == 1 and up in FONT else "*")
+    return "".join(out)
+
+
+def fit_text(text, room):
+    """`text` in at most `room` characters; a cut is shown with '..' at the end."""
+    text = plain_label(text)
+    if len(text) <= room:
+        return text
+    return text[:room - 2] + ".." if room >= 3 else text[:max(0, room)]
+
+
 def draw_text(img, x, y, text, color, scale=1):
-    """Draw `text` (upper-cased) into the uint8 RGB array at top-left (x, y); returns the width used."""
+    """Draw `text` (see plain_label) into the uint8 RGB array at top-left (x, y); returns the width used."""
     cx = x
-    for char in str(text).upper():
-        glyph = FONT.get(char, FONT["?"])
+    for char in plain_label(text):
+        glyph = FONT.get(char, FONT["*"])
         big = np.kron(glyph, np.ones((scale, scale), bool)) if scale > 1 else glyph
         gh, gw = big.shape
         y0, x0 = max(0, y), max(0, cx)
@@ -294,7 +348,7 @@ def draw_text(img, x, y, text, color, scale=1):
 
 
 def text_width(text, scale=1):
-    return len(str(text)) * 6 * scale
+    return len(plain_label(text)) * 6 * scale
 
 
 def compose_sheet(tiles, labels, title, sheet_max):
@@ -326,7 +380,7 @@ def compose_sheet(tiles, labels, title, sheet_max):
     sheet[:] = (24, 24, 24)
     if title:
         room = (width - 2 * gap) // (6 * scale)
-        draw_text(sheet, gap, 5, title[:room], (235, 235, 235), scale)
+        draw_text(sheet, gap, 5, fit_text(title, room), (235, 235, 235), scale)
     cells = []
     for i, (tile, text) in enumerate(zip(tiles, labels)):
         r, c = divmod(i, cols)
@@ -336,10 +390,11 @@ def compose_sheet(tiles, labels, title, sheet_max):
         small = resize_box(tile, tw, th) if k < 1.0 else tile
         sheet[y:y + bar, x:x + cw2] = (38, 38, 38)
         room = max(1, (cw2 - 8) // (6 * scale))
-        first, _, rest = text.partition(" | ")
-        used = draw_text(sheet, x + 4, y + 4, first[:room], (255, 196, 0), scale)
-        if rest and len(first) + 3 < room:
-            draw_text(sheet, x + 4 + used, y + 4, (" | " + rest)[:room - len(first)], (235, 235, 235), scale)
+        shown = fit_text(text, room)               # a label too long for its cell ends in '..'
+        first, sep, rest = shown.partition(" | ")
+        used = draw_text(sheet, x + 4, y + 4, first, (255, 196, 0), scale)
+        if sep:
+            draw_text(sheet, x + 4 + used, y + 4, sep + rest, (235, 235, 235), scale)
         ox, oy = x + (cw2 - tw) // 2, y + bar + (ch2 - th) // 2
         sheet[oy:oy + th, ox:ox + tw] = small[:th, :tw]
         cells.append({"index": i + 1, "x": int(ox), "y": int(oy), "w": int(tw), "h": int(th)})
@@ -402,6 +457,32 @@ class Changes:
             except Exception as error:   # keep going: every other change still has to be undone
                 errors.append("%s: %s" % (type(error).__name__, error))
         return errors
+
+
+def _handler_name(handler):
+    module = getattr(handler, "__module__", None) or "?"
+    name = getattr(handler, "__qualname__", None) or getattr(handler, "__name__", None) or repr(handler)
+    return "%s.%s" % (module, name)
+
+
+def pause_handlers(changes):
+    """Take the session's frame-change, depsgraph-update and render handlers out until `changes` is restored (they
+    go back in their order, in front of any added meanwhile). Returns {list name: [handler names]} of those paused."""
+    paused = {}
+    for name in HANDLER_LISTS:
+        handlers = getattr(bpy.app.handlers, name, None)
+        if not handlers:
+            continue
+        saved = list(handlers)
+        handlers.clear()
+
+        def back(handlers=handlers, saved=saved):
+            added = [h for h in handlers if h not in saved]
+            handlers.clear()
+            handlers.extend(saved + added)
+        changes.call(back)
+        paused[name] = [_handler_name(h) for h in saved]
+    return paused
 
 
 # ----------------------------------------------------------------------------------------------
@@ -478,12 +559,10 @@ def _layer_collections(fp, key, lc):
         _layer_collections(fp, key + "/" + child.name, child)
 
 
-def _fcurves(adt):
-    """The F-curves of an AnimData's assigned action (layered actions in 4.4+, plain ones before)."""
-    action = getattr(adt, "action", None)
+def _action_fcurves(action, slot):
+    """The F-curves of one action for one slot (layered actions in 4.4+, plain ones before)."""
     if action is None:
         return []
-    slot = getattr(adt, "action_slot", None)
     if slot is not None:
         try:
             from bpy_extras import anim_utils
@@ -495,6 +574,41 @@ def _fcurves(adt):
     return list(getattr(action, "fcurves", None) or [])
 
 
+def _nla_strips(adt):
+    """Every strip of every NLA track, meta strips opened."""
+    out = []
+
+    def walk(strips):
+        for strip in strips:
+            out.append(strip)
+            inner = getattr(strip, "strips", None)
+            if inner is not None and len(inner):
+                walk(inner)
+    for track in getattr(adt, "nla_tracks", None) or []:
+        walk(track.strips)
+    return out
+
+
+def _fcurves(adt):
+    """The F-curves that animate an AnimData: its active action's and those of every NLA strip's action (a channel
+    animated only through the NLA is overwritten by a frame change too)."""
+    out, seen = [], set()
+    sources = [(getattr(adt, "action", None), getattr(adt, "action_slot", None))]
+    sources += [(strip.action, getattr(strip, "action_slot", None)) for strip in _nla_strips(adt)
+                if getattr(strip, "action", None) is not None]
+    for action, slot in sources:
+        for fc in _action_fcurves(action, slot):
+            key = (fc.data_path, fc.array_index)
+            if key not in seen:
+                seen.add(key)
+                out.append(fc)
+    return out
+
+
+def _is_animated(adt):
+    return adt is not None and (adt.action is not None or any(len(t.strips) for t in adt.nla_tracks))
+
+
 def _animated_ids():
     for coll in (bpy.data.objects, bpy.data.materials, bpy.data.shape_keys, bpy.data.worlds, bpy.data.node_groups,
                  bpy.data.armatures, bpy.data.cameras, bpy.data.lights, bpy.data.scenes, bpy.data.meshes,
@@ -503,12 +617,51 @@ def _animated_ids():
             if idb.library is not None:
                 continue
             adt = getattr(idb, "animation_data", None)
-            if adt is not None and adt.action is not None:
+            if _is_animated(adt):
                 yield idb, adt
             tree = getattr(idb, "node_tree", None)
             tadt = getattr(tree, "animation_data", None) if tree is not None else None
-            if tadt is not None and tadt.action is not None:
+            if _is_animated(tadt):
                 yield tree, tadt
+
+
+def _python_drivers():
+    """'owner: data_path' of every driver whose expression needs Python (not a simple expression): with script
+    auto-run off Blender does not run them."""
+    out = []
+    for coll in (bpy.data.objects, bpy.data.meshes, bpy.data.shape_keys, bpy.data.materials, bpy.data.armatures,
+                 bpy.data.cameras, bpy.data.lights, bpy.data.worlds, bpy.data.scenes, bpy.data.curves,
+                 bpy.data.node_groups):
+        for idb in coll:
+            owners = [idb]
+            tree = getattr(idb, "node_tree", None)
+            if tree is not None:
+                owners.append(tree)
+            for owner in owners:
+                adt = getattr(owner, "animation_data", None)
+                if adt is None:
+                    continue
+                for fc in adt.drivers:
+                    drv = fc.driver
+                    if drv.type == "SCRIPTED" and not drv.is_simple_expression:
+                        out.append("%s: %s" % (idb.name_full, fc.data_path))
+    return out
+
+
+def keyed_range():
+    """(first, last) frame over every key and NLA strip in the file, or None when nothing is keyed."""
+    lo, hi = None, None
+    for _idb, adt in _animated_ids():
+        spans = []
+        for fc in _action_fcurves(adt.action, getattr(adt, "action_slot", None)):
+            if len(fc.keyframe_points):
+                spans.append(tuple(fc.range()))
+        for strip in _nla_strips(adt):
+            spans.append((strip.frame_start, strip.frame_end))
+        for a, b in spans:
+            lo = a if lo is None else min(lo, a)
+            hi = b if hi is None else max(hi, b)
+    return None if lo is None else (lo, hi)
 
 
 def snapshot_animated():
@@ -563,6 +716,102 @@ def restore_animated(snapshot):
     return written
 
 
+def _crc(value):
+    return zlib.crc32(repr(value).encode("utf-8", "backslashreplace")) & 0xFFFFFFFF
+
+
+def _tree_values(tree):
+    """A hash of every node's unlinked input values and settings in a node tree (None without a tree)."""
+    if tree is None:
+        return None
+    parts = []
+    for node in tree.nodes:
+        parts.append((node.name, node.bl_idname, node.mute))
+        for sock in node.inputs:
+            if not sock.is_linked and hasattr(sock, "default_value"):
+                parts.append((sock.identifier, _plain(sock.default_value)))
+        for prop in ("blend_type", "operation", "data_type", "interpolation", "image", "color_ramp"):
+            value = getattr(node, prop, None)
+            if value is None:
+                continue
+            if prop == "color_ramp":
+                value = [(e.position, tuple(e.color)) for e in value.elements]
+            parts.append((prop, _plain(value)))
+    parts.append(tuple((link.from_node.name, link.from_socket.identifier, link.to_node.name, link.to_socket.identifier)
+                       for link in tree.links))
+    return _crc(parts)
+
+
+def _idprops(idb):
+    """Custom properties of a datablock (cheap when it has none), as a hash."""
+    try:
+        keys = idb.keys()
+    except Exception:
+        return None
+    if not keys:
+        return None
+    items = []
+    for k in sorted(keys):
+        value = idb[k]
+        for conv in ("to_dict", "to_list"):
+            if hasattr(value, conv):
+                value = getattr(value, conv)()
+                break
+        items.append((k, repr(value)))
+    return _crc(items)
+
+
+def _content(fp, scene):
+    """What the datablocks hold, beyond their names: the 3D cursor, tool settings, cameras, lights, armatures,
+    materials, worlds, meshes, images, texts, custom properties, and which datablock each name is."""
+    cur = scene.cursor
+    fp["scene.cursor"] = _plain((cur.location, cur.rotation_mode, cur.rotation_euler, cur.rotation_quaternion))
+    _walk(fp, "scene.tool_settings", scene.tool_settings, 0)
+    for cam in bpy.data.cameras:
+        _walk(fp, "camera[%s]" % cam.name_full, cam, 0)
+    for light in bpy.data.lights:
+        _walk(fp, "light[%s]" % light.name_full, light, 0)
+        fp["light[%s].nodes" % light.name_full] = _tree_values(getattr(light, "node_tree", None))
+    for arm in bpy.data.armatures:
+        _walk(fp, "armature[%s]" % arm.name_full, arm, 0)
+    for mat in bpy.data.materials:
+        fp["material[%s]" % mat.name_full] = (_plain((mat.diffuse_color, mat.metallic, mat.roughness,
+                                                      getattr(mat, "blend_method", None))),
+                                              _tree_values(mat.node_tree))
+    for world in bpy.data.worlds:
+        fp["world[%s]" % world.name_full] = (_plain(world.color), _tree_values(world.node_tree))
+    hashed = 0
+    for me in bpy.data.meshes:
+        n = len(me.vertices)
+        coords = None
+        if n and hashed + n <= MAX_HASHED_VERTICES:
+            arr = np.empty(n * 3, np.float32)
+            me.vertices.foreach_get("co", arr)
+            coords = zlib.crc32(arr.tobytes()) & 0xFFFFFFFF
+            hashed += n
+        fp["mesh[%s]" % me.name_full] = (n, len(me.edges), len(me.polygons), coords)
+    for img in bpy.data.images:
+        if img.type in ("RENDER_RESULT", "COMPOSITING"):
+            continue
+        fp["image[%s]" % img.name_full] = (img.colorspace_settings.name, img.alpha_mode, img.filepath, img.source,
+                                           tuple(img.size), img.use_fake_user, img.packed_file is not None)
+    for text in bpy.data.texts:
+        fp["text[%s]" % text.name_full] = zlib.crc32(text.as_string().encode("utf-8", "surrogatepass")) & 0xFFFFFFFF
+    for prop in bpy.data.bl_rna.properties:
+        if prop.type != "COLLECTION" or prop.identifier in ("all_ids", "window_managers", "screens", "workspaces"):
+            continue
+        coll = getattr(bpy.data, prop.identifier, None)
+        if coll is None:
+            continue
+        try:
+            for idb in coll:
+                value = _idprops(idb)
+                if value is not None:
+                    fp["custom_properties[%s|%s]" % (prop.identifier, idb.name_full)] = value
+        except Exception:
+            continue
+
+
 def fingerprint(update=True):
     """A dict of everything this tool could touch (and more), for an equality check after the work."""
     win, scene, layer = _context()
@@ -598,9 +847,13 @@ def fingerprint(update=True):
             ob.data.name_full if ob.data is not None else None, ob.parent.name_full if ob.parent else None,
             ob.mode, ob.active_material_index,
         )
+        fp[key + ".display"] = _plain((ob.color, ob.show_wire, ob.show_name, ob.show_axis, ob.show_bounds,
+                                       ob.display_bounds_type, ob.show_texture_space, ob.show_all_edges))
         fp[key + ".authored"] = _plain((ob.location, ob.rotation_mode, ob.rotation_euler, ob.rotation_quaternion,
                                         ob.rotation_axis_angle, ob.scale))
-        if shown:     # an object outside the view layer keeps a stale matrix until something evaluates it
+        # Only an object the depsgraph evaluates has a current matrix: one outside the view layer or hidden with
+        # hide_viewport keeps whatever it had (identity after loading) until something evaluates it.
+        if shown and ob.visible_get(view_layer=layer):
             fp[key + ".matrix_world"] = _plain(ob.matrix_world)
         if ob.modifiers:
             fp[key + ".modifiers"] = tuple((m.name, m.show_viewport, m.show_render) for m in ob.modifiers)
@@ -619,6 +872,7 @@ def fingerprint(update=True):
     for idb, path, index, value in snapshot_animated():
         fp["animated[%s|%s|%s|%d]" % (type(idb).__name__, idb.name_full if isinstance(idb, bpy.types.ID) else idb.name,
                                       path, index)] = _plain(value)
+    _content(fp, scene)
     fp["active_object"] = layer.objects.active.name_full if layer is not None and layer.objects.active else None
     wm = bpy.context.window_manager
     for wi, window in enumerate(wm.windows if wm else []):
@@ -645,7 +899,11 @@ def fingerprint(update=True):
                 fp[akey + ".space"] = _plain((space.camera, space.lock_camera, space.show_region_ui,
                                               space.show_region_toolbar, space.show_region_header,
                                               space.local_view is not None, space.use_local_camera,
-                                              space.lens, space.clip_start, space.clip_end))
+                                              space.lens, space.clip_start, space.clip_end,
+                                              getattr(space, "use_local_collections", None)))
+                if space.local_view is not None and window.view_layer is not None:
+                    fp[akey + ".local_view_objects"] = frozenset(
+                        o.name_full for o in window.view_layer.objects if o.local_view_get(space))
             elif area.type == "PROPERTIES":
                 fp[akey + ".space"] = _plain((space.context, getattr(space, "use_pin_id", None),
                                               getattr(space, "pin_id", None)))
@@ -659,6 +917,7 @@ def fingerprint(update=True):
                         pass
     prefs = bpy.context.preferences
     fp["preferences.active_section"] = prefs.active_section
+    fp["preferences.state"] = _plain((prefs.view.ui_scale, prefs.is_dirty))
     if wm is not None and hasattr(wm, "addon_search"):
         fp["wm.addon_search"] = wm.addon_search
     for prop in bpy.data.bl_rna.properties:
@@ -668,12 +927,23 @@ def fingerprint(update=True):
         if coll is None:
             continue
         try:
-            names = frozenset(item.name_full for item in coll
-                              if not (prop.identifier == "images" and item.type == "RENDER_RESULT"))
+            items = [item for item in coll if not (prop.identifier == "images" and item.type == "RENDER_RESULT")]
+            names = frozenset(item.name_full for item in items)
+            # which datablock each name is: one removed and another made under the same name is a change
+            identity = _crc(sorted((item.name_full, item.as_pointer()) for item in items))
         except Exception:
             continue
         fp["data." + prop.identifier] = names
+        fp["data.%s (identity)" % prop.identifier] = identity
     return fp
+
+
+FINGERPRINT_COVERS = ("render, display, EEVEE and colour settings", "view layers and collection flags",
+                      "every object's visibility, selection, transforms, display settings and pose",
+                      "animated values (actions and NLA)", "shape keys", "3D views: shading, overlays, view, local view",
+                      "editors and tabs", "frame, mode, active object", "3D cursor and tool settings",
+                      "cameras, lights, armatures, materials, worlds, meshes, images, texts (contents)",
+                      "custom properties", "name and identity of every datablock", "preferences section and UI scale")
 
 
 def fingerprint_diff(before, after, limit=60):
@@ -686,6 +956,8 @@ def fingerprint_diff(before, after, limit=60):
             out.append("%s: new, %s" % (key, _short(after[key])))
         else:
             a, b = before[key], after[key]
+            if key.endswith(".ui_tab") and a == "UNSUPPORTED":
+                continue        # a sidebar never drawn has no tab; drawing it once picks one, and nothing sets it back
             if isinstance(a, frozenset) or isinstance(b, frozenset):
                 if a != b:
                     added, removed = sorted(set(b) - set(a)), sorted(set(a) - set(b))
@@ -751,7 +1023,7 @@ def check_identity(args):
     if want:
         have = bpy.data.filepath
         if os.sep in want or "/" in want:
-            same = bool(have) and os.path.normcase(os.path.abspath(have)) == os.path.normcase(os.path.abspath(want))
+            same = bool(have) and same_file(have, want)
         else:
             same = os.path.normcase(os.path.basename(have)) == os.path.normcase(want)
         if not same:
@@ -913,21 +1185,37 @@ def gather_points(objects, depsgraph, notes=None):
             chunks.append(corners @ mw[:3, :3].T + mw[:3, 3])
         elif ob.instance_type == "NONE" or ob.type not in ("EMPTY",):
             chunks.append(mw[:3, 3].reshape(1, 3))
-    seen = 0
+    # Instances (collection instances, particles, geometry nodes): sampled evenly over all of them, so a big
+    # scatter is framed whole. The stride doubles whenever the sample is full.
+    stride, total, kept = 1, 0, []
+    boxes = {}
     for inst in depsgraph.object_instances:
         if not inst.is_instance:
             continue
-        seen += 1
-        if seen > 200000:
-            if notes is not None:
-                notes.append("framing used the first 200000 instances only")
-            break
         parent = inst.parent.original if inst.parent is not None else None
         if parent not in wanted:
             continue
-        mw = np.array(inst.matrix_world, np.float64)
-        corners = np.array([tuple(c) for c in inst.object.bound_box], np.float64)
-        chunks.append(corners @ mw[:3, :3].T + mw[:3, 3])
+        total += 1
+        if (total - 1) % stride:
+            continue
+        obj = inst.object
+        key = (obj.name, obj.data.as_pointer() if getattr(obj, "data", None) is not None else 0)
+        if key not in boxes:
+            boxes[key] = np.array([tuple(c) for c in obj.bound_box], np.float64)
+        kept.append((np.array(inst.matrix_world, np.float64), key))
+        if len(kept) >= MAX_FIT_INSTANCES:
+            kept = kept[::2]
+            stride *= 2
+    groups = {}
+    for m, k in kept:
+        groups.setdefault(k, []).append(m)
+    for key, mats in groups.items():
+        mats = np.array(mats)
+        corners = boxes[key]
+        pts = np.einsum("nij,kj->nki", mats[:, :3, :3], corners) + mats[:, None, :3, 3]
+        chunks.append(pts.reshape(-1, 3))
+    if notes is not None and stride > 1:
+        notes.append("framing used 1 in %d of the %d instances (evenly spread)" % (stride, total))
     return np.concatenate(chunks) if chunks else np.zeros((0, 3))
 
 
@@ -965,17 +1253,30 @@ class Job:
             raise LookError("failed", "no scene or view layer in this Blender")
         self.background = bool(bpy.app.background)
         self.own = bool(self.args.get("own_process"))
+        want = self.args.get("expect_file")
+        if want and not (os.sep in want or "/" in want):
+            self.warnings.append("--expect-file %r was matched by file name only (a file of that name in any folder "
+                                 "would pass); give the full path to be strict" % want)
         self.mode = self.args.get("mode") or ("angles" if self.background else "viewport")
         if self.mode not in MODES:
             raise LookError("bad_args", "unknown mode %r; use one of %s" % (self.mode, ", ".join(MODES)))
+        if not self.args.get("mode") and self.background and not self.own:
+            self.warnings.append("no --mode given and this Blender runs in the background (no viewport anyone sees): "
+                                 "showing angles; give --mode to choose")
         self.shading = self.args.get("shading") or None
         if self.shading and self.shading not in SHADINGS:
             raise LookError("bad_args", "unknown shading %r; use one of %s" % (self.shading, ", ".join(SHADINGS)))
-        self.max_size = max(64, min(int(_num(self.args.get("max_size"), 768)), 4096))
-        self.sheet_max = max(256, min(int(_num(self.args.get("sheet_max"), 1536)), 8192))
-        self.margin = max(0.2, min(float(_num(self.args.get("fill"), 0.85)), 0.98))
-        self.fov = math.radians(max(5.0, min(float(_num(self.args.get("fov"), 35.0)), 120.0)))
+        self.max_size = self._clamped("max_size", 768, 64, 4096, int)
+        self.sheet_max = self._clamped("sheet_max", 1536, 256, 8192, int)
+        self.margin = self._clamped("fill", 0.85, 0.2, 0.98, float)
+        self.fov = math.radians(self._clamped("fov", 35.0, 5.0, 120.0, float))
         self.ortho = bool(self.args.get("ortho"))
+        distance = self.args.get("distance")
+        if distance not in (None, "") and float(distance) <= 0:
+            raise LookError("bad_args", "--distance must be more than 0 (Blender units from the targets' centre)")
+        if distance not in (None, "") and self.ortho:
+            raise LookError("bad_args", "--distance has no effect with --ortho (an orthographic view has no distance); "
+                            "leave one of them out")
         self._out_paths()
         t = time.perf_counter()
         self.fp_before = fingerprint()
@@ -986,38 +1287,65 @@ class Job:
         self.task_problems = []
         self.state = {}
         self.dv = None
+        self.paused = {}
+        self.run_handlers = bool(self.args.get("run_handlers"))
+        planning = Changes()
         try:
+            if not self.run_handlers:
+                self._note_paused(pause_handlers(planning))
             self._targets()
             self._backend()
             self._plan()
+            drawn = sum(1 for task in self.tasks if task["kind"] in ("draw", "image", "ui"))
+            if drawn > MAX_TILES:
+                raise LookError("bad_args", "%d pictures asked for; at most %d" % (drawn, MAX_TILES))
         except Exception:
+            planning.restore()
             self.job_changes.restore()
             raise
-        if len(self.tasks) > MAX_TILES + 24:
-            raise LookError("bad_args", "too many tiles")
+        planning.restore()
+        if self.own and not self.args.get("autoexec", True):
+            blocked = _python_drivers()
+            if blocked:
+                self.warnings.append("%d Python driver(s) did not run (script auto-run is off in this headless Blender, "
+                                     "so the values they drive stay put): %s; pass --enable-autoexec for a file you "
+                                     "trust" % (len(blocked), ", ".join(blocked[:5])))
         # force_deferred: tests only, to drive the bridge's deferred path from a background Blender.
         self.deferred = ((not self.background or bool(self.args.get("force_deferred")))
                          and self.args.get("deferred", True) is not False and len(self.tasks) > 1)
 
     # -- setup ------------------------------------------------------------------------------
 
+    def _clamped(self, key, default, low, high, kind):
+        value = kind(_num(self.args.get(key), default))
+        if not (low <= value <= high):
+            clamped = max(low, min(value, high))
+            self.warnings.append("%s %s is out of range (%s to %s): %s was used" % (key, value, low, high, clamped))
+            return clamped
+        return value
+
+    def _note_paused(self, paused):
+        for name, handlers in paused.items():
+            known = self.paused.setdefault(name, [])
+            known.extend(h for h in handlers if h not in known)
+
     def _out_paths(self):
         out = self.args.get("out") or ""
         if not out:
             raise LookError("bad_args", "no --out folder or .png")
         out = os.path.abspath(bpy.path.abspath(out))
-        if out.lower().endswith(".png"):
+        self.out_is_png = out.lower().endswith(".png")
+        if self.out_is_png:
             folder, stem = os.path.dirname(out), os.path.splitext(os.path.basename(out))[0]
             self.sheet_path = out
         else:
             folder, stem = out, "look_" + self.mode
             self.sheet_path = os.path.join(folder, stem + "_sheet.png")
-        if bpy.data.filepath:
-            blend_dir = os.path.normcase(os.path.dirname(os.path.abspath(bpy.data.filepath)))
-            if os.path.normcase(folder) == blend_dir:
-                raise LookError("refused", "--out is the folder of the open .blend (%s); pictures go elsewhere" % folder)
+        if bpy.data.filepath and same_file(folder, os.path.dirname(os.path.abspath(bpy.data.filepath))):
+            raise LookError("refused", "--out is the folder of the open .blend (%s); pictures go elsewhere" % folder)
         os.makedirs(long_path(folder), exist_ok=True)
         self.folder, self.stem = folder, stem
+        self.result_path = os.path.join(folder, stem + "_result.json")
         # Files Blender itself writes and reads back (renders, screenshots) go through its own file
         # functions, which stop at 259 characters on Windows: they get a short folder of their own.
         tmp = self.args.get("tmp_dir") or folder
@@ -1032,15 +1360,22 @@ class Job:
         names = [n for n in (self.args.get("targets") or []) if n]
         info = {"requested": names, "framed": [], "hidden": [], "excluded": [], "linked": [], "unhidden": []}
         if names:
-            missing = [n for n in names if bpy.data.objects.get(n) is None]
+            missing = [n for n in names if bpy.data.objects.get(n) is None and bpy.data.collections.get(n) is None]
             if missing:
-                raise LookError("bad_args", "no object named " + ", ".join(repr(m) for m in missing))
+                raise LookError("bad_args", "no object or collection named " + ", ".join(repr(m) for m in missing))
             chosen = []
             for name in names:
-                ob = bpy.data.objects[name]
-                for o in [ob] + list(ob.children_recursive):
-                    if o not in chosen:
-                        chosen.append(o)
+                ob = bpy.data.objects.get(name)
+                if ob is not None:            # an object first; a collection of the same name only when none is
+                    roots = [ob]
+                else:
+                    coll = bpy.data.collections[name]
+                    roots = list(coll.all_objects)
+                    info.setdefault("collections", {})[name] = [o.name_full for o in roots]
+                for root in roots:
+                    for o in [root] + list(root.children_recursive):
+                        if o not in chosen:
+                            chosen.append(o)
         else:
             chosen = [o for o in layer.objects if o.type in GEOMETRY or (o.type == "EMPTY" and o.instance_type != "NONE")]
         self.unhide = []
@@ -1063,6 +1398,16 @@ class Job:
                     info["hidden"].append(o.name_full)
                 continue
             targets.append(o)
+        # A rig named as a target brings the meshes it deforms (an Armature modifier, parented or not): they are what
+        # the rig moves, and --isolate keeps them.
+        named_rigs = {o for o in targets if o.type == "ARMATURE"} if names else set()
+        if named_rigs:
+            for o in layer.objects:
+                if o in targets or o.type != "MESH" or not o.visible_get(view_layer=layer):
+                    continue
+                if o.find_armature() in named_rigs:
+                    targets.append(o)
+                    info.setdefault("deformed_by_rig", []).append(o.name_full)
         if info["excluded"]:
             self.warnings.append("not drawn, not in the view layer (excluded collection or another scene): "
                                  + ", ".join(info["excluded"]))
@@ -1152,6 +1497,10 @@ class Job:
             return self.dv.space.shading.type.lower() + " (as set)"
         return "solid"
 
+    def _shading_short(self):
+        """The shading for a tile's label: the name alone ('as set' is in the JSON)."""
+        return self._shading_label().replace(" (as set)", "")
+
     def _effective_shading(self):
         if self.shading:
             return self.shading
@@ -1195,7 +1544,7 @@ class Job:
             region = self.dv.region
             w, h = self._fit_size(region.width, region.height)
             self.tasks.append({"kind": "draw", "view": "viewport", "w": w, "h": h, "frame": None,
-                               "label": "VIEWPORT | " + self._shading_label(), "slug": "viewport",
+                               "label": "VIEWPORT | " + self._shading_short(), "slug": "viewport",
                                "shows": {"view": "viewport"}})
         elif mode == "camera":
             cam = self.scene.camera
@@ -1203,34 +1552,52 @@ class Job:
                 raise LookError("refused", "the scene has no camera; use --mode angles")
             w, h = self._camera_size()
             self.tasks.append({"kind": "draw", "view": "camera", "w": w, "h": h, "frame": None,
-                               "label": "CAMERA %s | %s" % (cam.name, self._shading_label()), "slug": "camera",
+                               "label": "CAMERA %s | %s" % (cam.name, self._shading_short()), "slug": "camera",
                                "shows": {"view": "camera", "camera": cam.name_full}})
         elif mode == "angles":
             views = self.args.get("views") or list(DEFAULT_VIEWS)
             if len(views) > 6:
                 raise LookError("bad_args", "at most 6 views, got %d" % len(views))
             parsed = [self._parse_view(v) for v in views]
-            depsgraph = bpy.context.evaluated_depsgraph_get()
-            points = gather_points(self._framed(), depsgraph, self.warnings)
+            # Measured with --unhide / --isolate applied, as the pictures will be drawn: a target hidden with
+            # hide_viewport is only evaluated (and only has a current matrix) while it is shown.
+            measuring = Changes()
+            try:
+                self._visibility(measuring)
+                depsgraph = bpy.context.evaluated_depsgraph_get()
+                points = gather_points(self._framed(), depsgraph, self.warnings)
+            finally:
+                errors = measuring.restore()
+                self.layer.update()
+                if errors:
+                    self.task_problems.append("undo errors after measuring: " + "; ".join(errors))
             if not len(points):
                 self.warnings.append("nothing visible to frame; the views look at the world origin")
             size = self.max_size
             for name, vec in parsed:
                 spec = fit_view(points, vec, 1.0, self.fov, self.margin, self.ortho, self.args.get("distance"))
                 self.tasks.append({"kind": "draw", "view": spec, "w": size, "h": size, "frame": None,
-                                   "label": "%s | %s" % (name.upper(), self._shading_label()),
+                                   "label": "%s | %s" % (name.upper(), self._shading_short()),
                                    "slug": name.strip("()").replace(",", "_").replace(".", "p"),
                                    "shows": {"view": name, "direction": list(vec)}})
         elif mode == "frames":
             self._plan_frames()
         elif mode == "image":
             ref = self.args.get("image") or "Render Result"
-            self.tasks.append({"kind": "image", "ref": ref, "slug": "image"})
+            self.tasks.append({"kind": "image", "ref": ref, "file": self.args.get("image_file"), "slug": "image"})
         elif mode == "ui":
             spec = self.args.get("ui") or "window"
             if self.background:
-                raise LookError("refused", "ui: this Blender runs in the background and has no window to screenshot")
+                raise LookError("refused", "ui: this Blender runs in the background and has no window to screenshot. "
+                                + UI_NEXT_STEP + (" (--fallback applies to --mode viewport only)"
+                                                  if self.args.get("fallback") else ""))
             self.tasks.append({"kind": "ui", "spec": spec, "slug": "ui_" + spec.replace(":", "_").replace(" ", "_")})
+        # said for an armature asked for by name (in a whole scene, rigs beside their meshes are no news)
+        rigs = [o.name_full for o in self._framed() if o.type == "ARMATURE"] if self.target_info["requested"] else []
+        generated = any(t["kind"] == "draw" and t["view"] != "viewport" for t in self.tasks)
+        if rigs and generated and self.state.get("shading") != "xray" and not self.args.get("overlays"):
+            self.warnings.append("%s: an armature's bones are drawn only with --shading xray (or --overlays); this "
+                                 "shading shows the meshes it moves" % ", ".join(rigs[:4]))
 
     def _framed(self):
         return [o for o in self.targets if o.type not in ("LIGHT", "CAMERA", "SPEAKER", "LIGHT_PROBE")]
@@ -1246,15 +1613,34 @@ class Job:
     def _frame_list(self):
         scene = self.scene
         frames = [int(f) for f in (self.args.get("frames") or [])]
+        if scene.use_preview_range:
+            start, end, which = scene.frame_preview_start, scene.frame_preview_end, "preview range"
+        else:
+            start, end, which = scene.frame_start, scene.frame_end, "scene range"
+        self.state["frame_range"] = {"range": [start, end], "which": which}
         if not frames:
             count = max(2, min(int(_num(self.args.get("frame_count"), 6)), MAX_TILES))
-            start, end = scene.frame_start, scene.frame_end
             if end <= start:
                 frames = [start]
             else:
                 frames = sorted({int(round(start + (end - start) * i / (count - 1))) for i in range(count)})
+            self.state["frame_range"]["spread_over"] = True
         if len(frames) > MAX_TILES:
             raise LookError("bad_args", "at most %d frames, got %d" % (MAX_TILES, len(frames)))
+        outside = [f for f in frames if f < start or f > end]
+        if outside and len(outside) == len(frames):
+            self.warnings.append("every frame asked for (%s) is outside the %s %d-%d"
+                                 % (", ".join(str(f) for f in frames[:8]), which, start, end))
+        keys = keyed_range()
+        if keys is not None and len(frames) > 1:
+            lo, hi = keys
+            held = {min(max(float(f), lo), hi) for f in frames}
+            if len(held) == 1:
+                self.warnings.append("every frame asked for is beyond the keys in this file (keyed %g-%g): the tiles "
+                                     "can only differ through drivers, constraints or simulations" % (lo, hi))
+        elif keys is None and len(frames) > 1:
+            self.warnings.append("nothing in this file has keys: the tiles can only differ through drivers, "
+                                 "constraints or simulations")
         return frames
 
     def _plan_frames(self):
@@ -1301,7 +1687,7 @@ class Job:
                 w, h = self._fit_size(self.dv.region.width, self.dv.region.height)
             for f in frames:
                 self.tasks.append({"kind": "draw", "view": view, "w": w, "h": h, "frame": f,
-                                   "label": "FRAME %d | %s | %s" % (f, view.upper(), self._shading_label()),
+                                   "label": "FRAME %d | %s | %s" % (f, view.upper(), self._shading_short()),
                                    "slug": "f%04d" % f, "shows": {"view": view, "frame": f}})
             return
         name, vec = self._parse_view(view)
@@ -1315,7 +1701,7 @@ class Job:
         self.state["tile"] = (w, h)
         for f in frames:
             self.tasks.append({"kind": "draw", "view": "fitted", "w": w, "h": h, "frame": f,
-                               "label": "FRAME %d | %s | %s" % (f, label_view.upper(), self._shading_label()),
+                               "label": "FRAME %d | %s | %s" % (f, label_view.upper(), self._shading_short()),
                                "slug": "f%04d" % f, "shows": {"view": label_view, "direction": list(vec), "frame": f,
                                                               "center_bones": bones or None}})
 
@@ -1336,6 +1722,7 @@ class Job:
         try:
             budget = time.perf_counter() + float(_num(self.args.get("tick_budget"), 0.15))
             before = fingerprint()           # Blender's event loop ran since the last tick: check this tick alone
+            self.tick_before = before
             labels = []
             while self.done < len(self.tasks):
                 labels.append(self.tasks[self.done].get("label") or self.tasks[self.done]["kind"])
@@ -1357,6 +1744,11 @@ class Job:
     def _run_next(self):
         task = self.tasks[self.done]
         changes = Changes()
+        if not self.run_handlers:
+            # Handlers out first, back in last; the update just before they come back evaluates the put-back
+            # state while they are still out, so an add-on sees neither the temporary change nor its undo.
+            self._note_paused(pause_handlers(changes))
+            changes.call(lambda: self.layer.update())
         t = time.perf_counter()
         try:
             out = self._run(task, changes)
@@ -1375,7 +1767,7 @@ class Job:
             self._goto_frame(changes, task["frame"])
             self._visibility(changes)
             depsgraph = bpy.context.evaluated_depsgraph_get()
-            points = gather_points(self._framed(), depsgraph)
+            points = gather_points(self._framed(), depsgraph, self.warnings)
             if len(points) > 200000:
                 points = points[::int(math.ceil(len(points) / 200000))]
             center = None
@@ -1399,6 +1791,9 @@ class Job:
                 self.state["fixed"] = dist
             else:
                 allpts = np.concatenate([p for p, _c in measured.values() if len(p)] or [np.zeros((0, 3))])
+                if not len(allpts):
+                    self.warnings.append("nothing visible to frame in any of these frames; the view looks at the "
+                                         "world origin")
                 self.state["union"] = fit_view(allpts, vec, w / h, self.fov, self.margin, self.ortho,
                                                self.args.get("distance"))
             return None
@@ -1411,7 +1806,10 @@ class Job:
         raise LookError("failed", "unknown task " + kind)
 
     def _goto_frame(self, changes, frame):
-        if frame is None or frame == self.scene.frame_current and self.scene.frame_subframe == 0.0:
+        """Show the animation at `frame`. Every tile of a frames look goes through Blender's frame change, the one
+        at the session's current frame too: a tile labelled FRAME N shows what playback shows at N, not an edit
+        made since. The values as they were (unkeyed edits included) are written back afterwards."""
+        if frame is None:
             return
         scene, layer = self.scene, self.layer
         snapshot = snapshot_animated()
@@ -1424,13 +1822,32 @@ class Job:
 
         changes.call(back)
         scene.frame_set(int(frame))
+        if int(frame) == was[0] and was[1] == 0.0 and "unkeyed_checked" not in self.state:
+            self.state["unkeyed_checked"] = True
+            edited = []
+            for idb, path, index, value in snapshot:
+                try:
+                    now = idb.path_resolve(path)
+                    if hasattr(now, "__len__") and not isinstance(now, str):
+                        now = now[index]
+                except Exception:
+                    continue
+                if not _same(now, value, 1e-6):
+                    owner = idb.name_full if isinstance(idb, bpy.types.ID) else getattr(idb, "name", "?")
+                    edited.append("%s.%s[%d]" % (owner, path, index))
+            if edited:
+                self.warnings.append("FRAME %d is drawn from the keys; the session at that frame has unkeyed changes "
+                                     "(%s%s), which playback would replace; they are kept"
+                                     % (was[0], ", ".join(edited[:5]), ", ..." if len(edited) > 5 else ""))
 
     def _visibility(self, changes):
         layer = self.layer
         for o in self.unhide:
             if o.hide_get(view_layer=layer):
+                selected = o.select_get(view_layer=layer)
                 o.hide_set(False, view_layer=layer)
-                changes.call(lambda o=o: o.hide_set(True, view_layer=layer))
+                changes.call(lambda o=o, s=selected: (o.hide_set(True, view_layer=layer),
+                                                      o.select_set(s, view_layer=layer)))
             if o.hide_viewport:
                 changes.set(o, "hide_viewport", False)
         if self.args.get("isolate"):
@@ -1438,9 +1855,37 @@ class Job:
                 if o in self.target_set or o.type in ("LIGHT", "CAMERA"):
                     continue
                 if o.visible_get(view_layer=layer) and not o.hide_get(view_layer=layer):
+                    # hide_set deselects: the selection is put back with the object
+                    selected = o.select_get(view_layer=layer)
                     o.hide_set(True, view_layer=layer)
-                    changes.call(lambda o=o: o.hide_set(False, view_layer=layer))
+                    changes.call(lambda o=o, s=selected: (o.hide_set(False, view_layer=layer),
+                                                          o.select_set(s, view_layer=layer)))
         layer.update()
+
+    def _local_view(self, changes):
+        """The user's 3D view in local view draws only the objects in it: the targets are put in for the picture."""
+        space = self.dv.space if self.dv is not None else None
+        if space is None or space.type != "VIEW_3D":
+            return
+        layer = self.layer
+        if space.local_view is not None:
+            added = []
+            for o in self.targets:
+                if not o.local_view_get(space):
+                    o.local_view_set(space, True)
+                    changes.call(lambda o=o: o.local_view_set(space, False))
+                    added.append(o.name_full)
+            if added and "local_view" not in self.state:
+                self.state["local_view"] = True
+                self.warnings.append("the 3D view is in local view: %s put in it for the pictures and taken out "
+                                     "again" % ", ".join(added[:6]))
+            layer.update()
+        if getattr(space, "use_local_collections", False) and "local_collections" not in self.state:
+            unseen = [o.name_full for o in self.targets if not o.visible_in_viewport_get(space)]
+            self.state["local_collections"] = True
+            if unseen:
+                self.warnings.append("hidden in this 3D view's own collection visibility (local collections), so "
+                                     "not drawn: %s" % ", ".join(unseen[:6]))
 
     def _resolve_view(self, task):
         view = task["view"]
@@ -1454,11 +1899,15 @@ class Job:
         if view == "camera":
             depsgraph = bpy.context.evaluated_depsgraph_get()
             cam = self.scene.camera.evaluated_get(depsgraph)
-            r = self.scene.render
-            proj = cam.calc_matrix_camera(depsgraph, x=w, y=h, scale_x=r.pixel_aspect_x, scale_y=r.pixel_aspect_y)
+            # w and h are already display pixels (the render's pixel aspect is in them, see _camera_size): the
+            # pixel aspect must not be applied a second time.
+            proj = cam.calc_matrix_camera(depsgraph, x=w, y=h, scale_x=1.0, scale_y=1.0)
+            toward_eye = (cam.matrix_world.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized()
+            far = float(getattr(cam.data, "clip_end", 1000.0)) if cam.type == "CAMERA" else 1000.0
             return ViewSpec(kind="camera", view_matrix=cam.matrix_world.inverted(), proj_matrix=proj,
                             cam_matrix=cam.matrix_world.copy(), eye=tuple(cam.matrix_world.translation),
-                            camera=self.scene.camera.name_full, ortho=cam.data.type == "ORTHO")
+                            camera=self.scene.camera.name_full, direction=tuple(toward_eye), far=far,
+                            ortho=cam.type == "CAMERA" and cam.data.type == "ORTHO")
         if view == "fitted":
             if self.state["bones"]:
                 points, center = self.state["measured"][task["frame"]]
@@ -1542,7 +1991,11 @@ class Job:
         w, h = task["w"], task["h"]
         generated = spec.kind != "viewport"
         draws, settled = 1, True
+        if spec.kind == "fit":
+            self._note_tiny(spec, w, h, task)
         if self.backend == "draw":
+            if generated:
+                self._local_view(changes)
             self._apply_shading(changes, generated)
             pixels = self._draw_pixels(spec, w, h)
             kind = self.dv.space.shading.type
@@ -1576,24 +2029,30 @@ class Job:
                                  % (task["label"], draws))
         return tile
 
-    # -- the render fallback ----------------------------------------------------------------
+    def _note_tiny(self, spec, w, h, task):
+        """A framed target that comes out smaller than TINY_PX in a fitted tile (far from the others, or tiny
+        beside them) is named in a warning: it is in the picture but cannot be seen."""
+        framed = [o for o in self._framed() if o.type in GEOMETRY]
+        if not framed or len(framed) > 64:
+            return
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        view = (task.get("shows") or {}).get("view") or "?"
+        if task.get("frame") is not None:
+            view = "frame %d" % task["frame"]
+        for ob in framed:
+            ev = ob.evaluated_get(depsgraph)
+            mw = np.array(ev.matrix_world, np.float64)
+            corners = np.array([tuple(c) for c in ev.bound_box], np.float64) @ mw[:3, :3].T + mw[:3, 3]
+            if float(np.linalg.norm(corners.max(0) - corners.min(0))) <= 1e-9:
+                continue          # no geometry of its own (an instancer's empty box): nothing to be too small
+            x, y, front = project(corners, spec.view_matrix, spec.proj_matrix, w, h)
+            if not front.all():
+                continue
+            size = max(float(x.max() - x.min()), float(y.max() - y.min()))
+            if size < TINY_PX:
+                self.state.setdefault("tiny", {}).setdefault(ob.name_full, []).append((str(view).upper(), size))
 
-    def _render_result_has_data(self):
-        rr = bpy.data.images.get("Render Result")
-        if rr is None:
-            return False, None
-        probe = os.path.join(self.tmp, ".look_rr_probe_%d.png" % os.getpid())
-        changes = Changes()
-        try:
-            self._png_settings(changes)
-            rr.save_render(probe, scene=self.scene)
-            return True, rr
-        except RuntimeError:
-            return False, rr
-        finally:
-            changes.restore()
-            if os.path.exists(probe):
-                os.remove(probe)
+    # -- the render fallback ----------------------------------------------------------------
 
     def _png_settings(self, changes):
         ims = self.scene.render.image_settings
@@ -1624,23 +2083,29 @@ class Job:
         changes.set(ims, "compression", 15)
 
     def _render_pixels(self, changes, spec, w, h, task):
+        """Render one tile through a temporary copy of the scene (scene.copy(): the same objects and collections,
+        its own settings and its own render result), so the user's render settings and the picture in their Render
+        Result are never touched; the copy is removed afterwards."""
         scene, layer = self.scene, self.layer
         shading = self.state["shading"] or "solid"
-        if "rr_checked" not in self.state:
-            has, rr = self._render_result_has_data()
-            self.state["rr_checked"] = True
-            self.state["rr_existed"] = rr is not None
-            if has and not self.own:
-                raise LookError("refused", "the render fallback would replace the render in this Blender's Render "
-                                "Result; save it first or look with the draw backend")
-        r = scene.render
+        if "rr_existed" not in self.state:
+            self.state["rr_existed"] = bpy.data.images.get("Render Result") is not None
+        if not self.state["rr_existed"]:
+            def drop_result():           # rendering makes a Render Result datablock: it goes again (undone last)
+                rr = bpy.data.images.get("Render Result")
+                if rr is not None and rr.type == "RENDER_RESULT":
+                    bpy.data.images.remove(rr)
+            changes.call(drop_result)
+        copy = scene.copy()
+        changes.call(lambda: bpy.data.scenes.remove(copy))
+        r = copy.render
         if spec.kind == "camera":
             cam = scene.camera
         else:
             data = bpy.data.cameras.new("look_tmp_camera")
             cam = bpy.data.objects.new("look_tmp_camera", data)
             changes.call(lambda: (bpy.data.objects.remove(cam), bpy.data.cameras.remove(data)))
-            scene.collection.objects.link(cam)
+            copy.collection.objects.link(cam)
             cam.matrix_world = spec.cam_matrix
             data.sensor_fit = "VERTICAL"
             data.clip_start, data.clip_end = spec.near, spec.far
@@ -1649,44 +2114,47 @@ class Job:
                 data.ortho_scale = 2.0 * (spec.half_height or 1.0)
             else:
                 data.angle_y = math.radians(spec.fov_deg)
-            changes.set(scene, "camera", cam)
-        changes.set(r, "resolution_x", w)
-        changes.set(r, "resolution_y", h)
-        changes.set(r, "resolution_percentage", 100)
-        if spec.kind != "camera":
-            changes.set(r, "pixel_aspect_x", 1.0)
-            changes.set(r, "pixel_aspect_y", 1.0)
+            copy.camera = cam
+        r.resolution_x, r.resolution_y, r.resolution_percentage = w, h, 100
+        # w and h are display pixels for every view (the camera's pixel aspect is folded into them)
+        r.pixel_aspect_x, r.pixel_aspect_y = 1.0, 1.0
         for name, value in (("use_border", False), ("use_compositing", False), ("use_sequencer", False),
                             ("use_multiview", False), ("use_single_layer", True), ("use_persistent_data", False)):
-            changes.set(r, name, value)
+            if hasattr(r, name):
+                setattr(r, name, value)
         engine = "BLENDER_WORKBENCH"
         if shading == "material":
-            engine = _engine_eevee(scene)
+            engine = _engine_eevee(copy)
         elif shading == "rendered":
-            engine = r.engine if r.engine in EEVEE_IDS + ("BLENDER_WORKBENCH",) else _engine_eevee(scene)
+            engine = r.engine if r.engine in EEVEE_IDS + ("BLENDER_WORKBENCH",) else _engine_eevee(copy)
             if engine != r.engine and "rendered_engine" not in self.state:
                 self.state["rendered_engine"] = True
                 self.warnings.append("the scene renders with %s; 'rendered' was rendered with EEVEE" % r.engine)
-        changes.set(r, "engine", engine)
+        r.engine = engine
         if shading != "rendered":
-            changes.set(r, "film_transparent", True)
-        disp = scene.display.shading
+            r.film_transparent = True
+        disp = copy.display.shading
         if shading == "xray":
-            changes.set(disp, "show_xray", True)
-            changes.set(disp, "xray_alpha", 0.5)
+            disp.show_xray, disp.xray_alpha = True, 0.5
         elif shading == "wireframe":
-            changes.set(disp, "light", "STUDIO")
-            changes.set(disp, "color_type", "SINGLE")
-            changes.set(disp, "single_color", (0.8, 0.8, 0.8))
-            changes.set(disp, "show_xray", False)
-        if engine in EEVEE_IDS and scene.eevee.taa_render_samples > 16:
-            changes.set(scene.eevee, "taa_render_samples", 16)
+            disp.light, disp.color_type = "STUDIO", "SINGLE"
+            disp.single_color, disp.show_xray = (0.8, 0.8, 0.8), False
+        if engine in EEVEE_IDS and copy.eevee.taa_render_samples > 16:
+            copy.eevee.taa_render_samples = 16
+        if r.use_simplify:               # the viewport's simplify levels, not the render's
+            for a, b in (("simplify_subdivision_render", "simplify_subdivision"),
+                         ("simplify_child_particles_render", "simplify_child_particles")):
+                if hasattr(r, a) and hasattr(r, b):
+                    setattr(r, a, getattr(r, b))
         if shading == "material":
-            self._studio_world(changes)
-        # Render what the viewport shows: viewport visibility decides, per object.
-        for coll in [scene.collection] + list(scene.collection.children_recursive):
+            self._studio_world(changes, copy)
+        # Render what the viewport shows: viewport visibility decides, per object, and every modifier as the
+        # viewport has it (on or off, subdivision levels). Objects and collections are shared with the user's
+        # scene, so these go through `changes`.
+        for coll in copy.collection.children_recursive:
             if coll.hide_render:
                 changes.set(coll, "hide_render", False)
+        differs = []
         for o in layer.objects:
             if o is cam:
                 continue
@@ -1695,17 +2163,27 @@ class Job:
                 want = False
             if o.hide_render == want:
                 changes.set(o, "hide_render", not want)
-        self._png_settings(changes)
+            if not want or o.library is not None:
+                continue
+            for m in getattr(o, "modifiers", []):
+                if m.show_render != m.show_viewport:
+                    changes.set(m, "show_render", m.show_viewport)
+                    differs.append("%s/%s" % (o.name, m.name))
+                if m.type in ("SUBSURF", "MULTIRES") and m.show_viewport and m.render_levels != m.levels:
+                    changes.set(m, "render_levels", m.levels)
+                    differs.append("%s/%s levels" % (o.name, m.name))
+        if differs and "modifier_note" not in self.state:
+            self.state["modifier_note"] = True
+            self.warnings.append("render fallback: modifiers set differently for render were rendered as the "
+                                 "viewport has them: %s" % ", ".join(differs[:6]))
+        ims = r.image_settings
+        if hasattr(ims, "media_type"):
+            ims.media_type = "IMAGE"
+        ims.file_format, ims.color_mode, ims.color_depth, ims.compression = "PNG", "RGBA", "8", 15
         tmp = os.path.join(self.tmp, ".look_render_%d_%d.png" % (os.getpid(), len(self.tiles)))
-        if not self.state["rr_existed"]:
-            def drop_result():
-                rr = bpy.data.images.get("Render Result")
-                if rr is not None and rr.type == "RENDER_RESULT":
-                    bpy.data.images.remove(rr)
-            changes.call(drop_result)
-        bpy.ops.render.render(write_still=False, layer=layer.name)
+        bpy.ops.render.render(write_still=False, scene=copy.name, layer=layer.name)
         try:
-            bpy.data.images["Render Result"].save_render(tmp, scene=scene)
+            bpy.data.images["Render Result"].save_render(tmp, scene=copy)
             rgba, _fmt = read_image_file(tmp)
         finally:
             if os.path.exists(tmp):
@@ -1718,6 +2196,9 @@ class Job:
             self._overlay_bones(rgb, spec, w, h)
         if "render_notes" not in self.state:
             self.state["render_notes"] = True
+            self.warnings.append("render fallback: each tile is rendered from a temporary copy of the scene (the "
+                                 "animation evaluated at the frame: unkeyed changes do not show); the Render Result "
+                                 "and the render settings are left as they were")
             notes = {"solid": "Workbench render with the scene's Workbench settings (not the viewport's)",
                      "material": "EEVEE with the bundled studio HDRI (forest.exr) and the scene's lights off, "
                                  "background transparent",
@@ -1729,8 +2210,8 @@ class Job:
             self.warnings.append("render fallback, %s: %s" % (shading, notes.get(shading, "")))
         return rgb
 
-    def _studio_world(self, changes):
-        scene = self.scene
+    def _studio_world(self, changes, scene):
+        """A temporary world lit by Blender's bundled studio HDRI, for `scene` (the temporary copy)."""
         folder = bpy.utils.system_resource("DATAFILES", path="studiolights/world")
         path = os.path.join(folder, "forest.exr") if folder else ""
         world = bpy.data.worlds.new("look_tmp_world")
@@ -1749,7 +2230,7 @@ class Job:
             tree.links.new(env.outputs["Color"], background.inputs["Color"])
         elif background is not None:
             background.inputs["Color"].default_value = (0.5, 0.5, 0.5, 1.0)
-        changes.set(scene, "world", world)
+        scene.world = world
 
     def _overlay_edges(self, rgba, spec, w, h):
         from mathutils.bvhtree import BVHTree
@@ -1790,18 +2271,27 @@ class Job:
         segs = np.concatenate(segs)
         bvh = BVHTree.FromPolygons(verts.tolist(), tris.tolist()) if len(tris) <= 600000 else None
         if bvh is None:
-            self.warnings.append("wireframe fallback: too many triangles to test hidden edges; all edges drawn")
+            self.warnings.append("wireframe fallback: too many triangles to test which edges are hidden; hidden "
+                                 "edges are drawn too")
         x, y, front = project(verts, spec.view_matrix, spec.proj_matrix, w, h)
         a, b = segs[:, 0], segs[:, 1]
         keep = front[a] & front[b]
         a, b = a[keep], b[keep]
+        max_edges = 400000
+        if len(a) > max_edges:          # memory: a few points per edge, for millions of edges, is gigabytes
+            stride = int(math.ceil(len(a) / max_edges))
+            a, b = a[::stride], b[::stride]
+            self.warnings.append("wireframe fallback: the targets have %d edges, more than %d: an even sample of "
+                                 "them is drawn" % (len(segs), max_edges))
         length = np.hypot(x[b] - x[a], y[b] - y[a])
-        steps = np.clip(np.ceil(length / 1.5).astype(int) + 1, 2, 400)
+        steps = np.clip(np.ceil(length / 1.5).astype(np.int64) + 1, 2, 400)
         budget = 150000
         if steps.sum() > budget:
-            steps = np.maximum(2, (steps * budget / steps.sum()).astype(int))
+            steps = np.maximum(2, (steps * budget / steps.sum()).astype(np.int64))
+        # every edge sampled at `steps` points from 0 to 1, all edges at once
         idx = np.repeat(np.arange(len(a)), steps)
-        t = np.concatenate([np.linspace(0.0, 1.0, s) for s in steps]) if len(steps) else np.zeros(0)
+        starts = np.cumsum(steps) - steps
+        t = (np.arange(int(steps.sum())) - np.repeat(starts, steps)) / np.repeat(np.maximum(steps - 1, 1), steps)
         pa, pb = verts[a[idx]], verts[b[idx]]
         pw = pa + (pb - pa) * t[:, None]
         sx, sy, sf = project(pw, spec.view_matrix, spec.proj_matrix, w, h)
@@ -1870,7 +2360,9 @@ class Job:
         from_file = None
         declared = image.colorspace_settings.name if image is not None and image.type != "RENDER_RESULT" else None
         if image is None:
-            path = os.path.abspath(bpy.path.abspath(ref))
+            # a file: the path as the caller's machine resolved it (look.py makes a relative path absolute where it
+            # was typed), else as this Blender resolves it
+            path = task.get("file") or os.path.abspath(bpy.path.abspath(ref))
             if not os.path.isfile(path):
                 raise LookError("bad_args", "no image named %r in the file and no file at %r" % (ref, path))
             image = bpy.data.images.load(path, check_existing=False)
@@ -1976,6 +2468,10 @@ class Job:
                     raise LookError("refused", "ui %s: no 3D viewport in this window" % kind)
                 if kind == "sidebar":
                     space = area.spaces.active
+                    first = next((r for r in area.regions if r.type == "UI"), None)
+                    if first is not None and getattr(first, "active_panel_category", None) == "UNSUPPORTED":
+                        self.warnings.append("this 3D view's sidebar had never been open: Blender now remembers a tab "
+                                             "for it, which nothing can unset (harmless; the sidebar is closed again)")
                     changes.set(space, "show_region_ui", True)
                     redraw(area)
                     ui = next((r for r in area.regions if r.type == "UI"), None)
@@ -2063,27 +2559,84 @@ class Job:
     # -- finishing --------------------------------------------------------------------------
 
     def _fail(self, code, message):
+        # A deferred job is checked tick by tick: what changed between ticks was someone else (the user deleting a
+        # target, say), and only what the failed tick itself left changed counts against the tool.
+        tick_diff = []
+        if self.deferred and getattr(self, "tick_before", None) is not None:
+            try:
+                tick_diff = fingerprint_diff(self.tick_before, fingerprint())
+            except Exception:
+                tick_diff = ["the fingerprint could not be read after the failure"]
         problems = self.job_changes.restore()
         try:
             diff = fingerprint_diff(self.fp_before, fingerprint())
         except Exception:
             diff = ["the fingerprint could not be read after the failure"]
+        if self.deferred:
+            blamed = tick_diff + self.task_problems + problems
+            meanwhile = [d for d in diff if d not in tick_diff]
+        else:
+            blamed, meanwhile = diff + self.task_problems + problems, []
+        last = message.strip().splitlines()[-1] if message else code
+        if "has been removed" in last or "ReferenceError" in last:
+            last = ("something this look was using was removed while it ran (a target deleted between ticks?): "
+                    + last)
         out = self._base_result()
-        out.update({"ok": False, "code": code, "error": message.strip().splitlines()[-1] if message else code,
-                    "detail": message if "\n" in (message or "") else None})
-        out["fingerprint"] = {"checked": True, "equal": not diff and not self.task_problems and not problems,
-                              "differences": diff + self.task_problems + problems}
-        if diff or self.task_problems or problems:
-            out["error"] += " | AND THE SESSION WAS NOT PUT BACK: " + "; ".join((diff + self.task_problems + problems)[:6])
+        out.update({"ok": False, "code": code, "error": last, "detail": message if "\n" in (message or "") else None})
+        out["fingerprint"] = {"checked": True, "equal": not blamed, "differences": blamed,
+                              "covers": list(FINGERPRINT_COVERS)}
+        if meanwhile:
+            out["fingerprint"]["changed_meanwhile"] = meanwhile
+        if blamed:
+            out["error"] += " | AND THE SESSION WAS NOT PUT BACK: " + "; ".join(blamed[:6])
         return out
 
     def _base_result(self):
-        return {"tool": "look", "version": LOOK_VERSION, "mode": self.mode, "backend": getattr(self, "backend", None),
-                "shading": self._shading_label() if hasattr(self, "backend") else self.shading,
-                "blender": {"version": bpy.app.version_string, "pid": os.getpid(), "file": bpy.data.filepath,
-                            "background": self.background, "scene": self.scene.name},
-                "targets": getattr(self, "target_info", None), "warnings": self.warnings,
-                "deferred": getattr(self, "deferred", False)}
+        out = {"tool": "look", "version": LOOK_VERSION, "mode": self.mode, "backend": getattr(self, "backend", None),
+               "shading": self._shading_label() if hasattr(self, "backend") else self.shading,
+               "blender": {"version": bpy.app.version_string, "pid": os.getpid(), "file": bpy.data.filepath,
+                           "background": self.background, "scene": self.scene.name},
+               "targets": getattr(self, "target_info", None),
+               "warnings": list(dict.fromkeys(self.warnings)),          # each said once
+               "deferred": getattr(self, "deferred", False)}
+        if getattr(self, "paused", None):
+            out["handlers_paused"] = self.paused
+        if "frame_range" in getattr(self, "state", {}):
+            out["frames"] = dict(self.state["frame_range"], list=self.state.get("frames"))
+        return out
+
+    def _handler_warnings(self):
+        frame_lists = ("frame_change_pre", "frame_change_post")
+        if self.mode != "frames":
+            return
+        if self.run_handlers:
+            names = [_handler_name(h) for n in frame_lists for h in getattr(bpy.app.handlers, n, [])]
+            if names:
+                self.warnings.append("frame-change handlers ran on every frame change of this look (%s): their side "
+                                     "effects are not undone" % ", ".join(names[:4]))
+        else:
+            names = [h for n in frame_lists for h in self.paused.get(n, [])]
+            if names:
+                self.warnings.append("frame-change handlers were paused while the frames were shown (%s): the pictures "
+                                     "show the animation without them, and they saw none of the frame changes; "
+                                     "--run-handlers lets them run" % ", ".join(names[:4]))
+
+    def _clear_old_files(self):
+        """This tool's earlier pictures and result under the same name, so the folder holds only this run's."""
+        pattern = re.compile(r"^%s_(\d{2}_.+\.png|sheet\.png|result\.json)$" % re.escape(self.stem), re.IGNORECASE)
+        try:
+            names = os.listdir(long_path(self.folder))
+        except OSError:
+            return []
+        removed = []
+        for name in names:
+            if pattern.match(name) or (self.out_is_png and name.lower() == os.path.basename(self.sheet_path).lower()):
+                try:
+                    os.remove(long_path(os.path.join(self.folder, name)))
+                    removed.append(name)
+                except OSError:
+                    pass
+        return removed
 
     def finish(self):
         problems = self.job_changes.restore()
@@ -2092,11 +2645,18 @@ class Job:
         self.timing["fingerprint_after_s"] = round(time.perf_counter() - t, 4)
         diff = fingerprint_diff(self.fp_before, after)
         tiles = [t for t in self.tiles if t is not None]
-        out = self._base_result()
+        self._handler_warnings()
+        for name, seen in sorted((self.state.get("tiny") or {}).items()):
+            where = ", ".join("%s %.1f px" % (v, s) for v, s in seen[:4])
+            self.warnings.append("%s is too small to see (%s): it is far from the other targets or tiny beside them; "
+                                 "look at it alone with --target %s" % (name, where, name))
         written = []
         records = []
+        replaced = self._clear_old_files() if tiles else []
+        single = self.out_is_png and len(tiles) == 1      # --out X.png with one picture: X.png is that picture
+        sheet_path = os.path.join(self.folder, self.stem + "_sheet.png") if single else self.sheet_path
         for i, tile in enumerate(tiles, 1):
-            path = os.path.join(self.folder, "%s_%02d_%s.png" % (self.stem, i, tile["slug"]))
+            path = self.sheet_path if single else os.path.join(self.folder, "%s_%02d_%s.png" % (self.stem, i, tile["slug"]))
             write_png(path, tile["pixels"])
             written.append(path)
             rec = {k: v for k, v in tile.items() if k != "pixels"}
@@ -2104,32 +2664,50 @@ class Job:
             records.append(rec)
         sheet_info = None
         if tiles:
-            title = "%s | %s | %s" % (self.mode.upper(), self._shading_label() if self.backend != "none" else "",
+            title = "%s | %s | %s" % (self.mode.upper(), self._shading_short() if self.backend != "none" else "",
                                       ", ".join(self.target_info["framed"][:6]) if self.target_info["requested"] else
                                       (os.path.basename(bpy.data.filepath) or "unsaved file"))
             sheet, cells, grid = compose_sheet([t["pixels"] for t in tiles], [t["label"] for t in tiles], title,
                                                self.sheet_max)
-            write_png(self.sheet_path, sheet)
-            written.append(self.sheet_path)
-            sheet_info = {"path": self.sheet_path, "size": [int(sheet.shape[1]), int(sheet.shape[0])],
+            write_png(sheet_path, sheet)
+            written.append(sheet_path)
+            for cell, rec in zip(cells, records):
+                cell["label"] = rec["label"]
+            sheet_info = {"path": sheet_path, "size": [int(sheet.shape[1]), int(sheet.shape[0])],
                           "cells": cells, **grid}
         self.timing["total_s"] = round(time.perf_counter() - self.t0, 4)
         authoritative = (self.task_problems + problems) if self.deferred else (diff + self.task_problems + problems)
+        out = self._base_result()             # again: the warnings above are in it now
         out.update({"ok": not authoritative, "sheet": sheet_info, "tiles": records, "written": written,
                     "timing": self.timing,
                     "fingerprint": {"checked": True, "equal": not authoritative, "values": len(after),
-                                    "differences": authoritative,
+                                    "differences": authoritative, "covers": list(FINGERPRINT_COVERS),
                                     "how": ("before and after every bridge tick (%d ticks; each puts everything back "
                                             "before Blender's event loop runs)" % getattr(self, "ticks", 0)
                                             if self.deferred else "before the first change and after the last undo")},
                     "file_marked_modified": bool(bpy.data.is_dirty) and not self.dirty_before})
+        if replaced:
+            out["replaced_earlier_files"] = replaced
         if self.deferred and diff and not authoritative:
             out["fingerprint"]["changed_meanwhile"] = diff
-            self.warnings.append("the session changed between tiles (the user, or another tool); each tile itself "
-                                 "was put back")
+            out["warnings"].append("the session changed between tiles (the user, or another tool); each tile itself "
+                                   "was put back")
         if authoritative:
             out["code"] = "left_changed"
             out["error"] = "THE SESSION WAS NOT PUT BACK AS IT WAS: " + "; ".join(authoritative[:8])
+        if tiles:
+            # The whole result beside the pictures: a caller that gave up waiting (--timeout) can read it there.
+            out["result_file"] = self.result_path
+            written.append(self.result_path)
+            try:
+                text = json.dumps(out, default=str)
+                with open(long_path(self.result_path + ".part"), "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                os.replace(long_path(self.result_path + ".part"), long_path(self.result_path))
+            except OSError as error:
+                written.remove(self.result_path)
+                out.pop("result_file", None)
+                out["warnings"].append("could not write the result file: %s" % error)
         return out
 
 
@@ -2158,6 +2736,44 @@ def bridge_start(args):
     return job.run_all()
 
 
+class _Tee(io.TextIOBase):
+    """Text written to the log as usual and kept, for the result."""
+
+    def __init__(self, stream):
+        self.stream, self.kept = stream, io.StringIO()
+
+    def write(self, text):
+        self.kept.write(text)
+        try:
+            return self.stream.write(text)
+        except Exception:
+            return len(text)
+
+    def flush(self):
+        try:
+            self.stream.flush()
+        except Exception:
+            pass
+
+
+def run_setup(path):
+    """Run a --setup script as Blender's --python would (__name__ '__main__', __file__ set), keeping what it prints.
+    Returns ({path, output}, None) or ({...}, the traceback text) when it fails."""
+    tee = _Tee(sys.stdout)
+    failure = None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            code = compile(handle.read(), path, "exec")
+        with contextlib.redirect_stdout(tee), contextlib.redirect_stderr(tee):
+            exec(code, {"__name__": "__main__", "__file__": path, "__builtins__": __builtins__})
+    except SystemExit as error:
+        failure = "SystemExit: the --setup script called sys.exit(%r); it must end by returning" % (error.code,)
+    except BaseException:
+        failure = traceback.format_exc()
+    lines = tee.kept.getvalue().splitlines()
+    return {"path": path, "output": lines[-40:], "lines": len(lines)}, failure
+
+
 def _headless_main():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     if not argv:
@@ -2165,15 +2781,26 @@ def _headless_main():
         return
     with open(long_path(argv[0]), encoding="utf-8") as handle:
         args = json.load(handle)
-    try:
-        result = run(args)
-    except Exception:
-        result = {"ok": False, "code": "failed", "error": traceback.format_exc().strip().splitlines()[-1],
-                  "detail": traceback.format_exc()}
+    setup = args.get("setup")
+    setup_info = None
+    result = None
+    if setup:
+        setup_info, failure = run_setup(setup)
+        if failure:
+            result = {"ok": False, "code": "failed", "tool": "look", "version": LOOK_VERSION,
+                      "error": "the --setup script failed: " + failure.strip().splitlines()[-1],
+                      "detail": failure}
+    if result is None:
+        try:
+            result = run(args)
+        except Exception:
+            result = {"ok": False, "code": "failed", "error": traceback.format_exc().strip().splitlines()[-1],
+                      "detail": traceback.format_exc()}
+    if setup_info is not None:
+        result["setup"] = setup_info
     save_as = args.get("save_as")
     if save_as and result.get("ok"):
-        target = os.path.normcase(os.path.abspath(save_as))
-        if bpy.data.filepath and target == os.path.normcase(os.path.abspath(bpy.data.filepath)):
+        if any(same_file(save_as, p) for p in (bpy.data.filepath, args.get("input_blend")) if p):
             result["ok"], result["code"] = False, "refused"
             result["error"] = "--save-as is the input file; it is never overwritten"
         else:

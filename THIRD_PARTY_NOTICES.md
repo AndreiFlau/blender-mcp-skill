@@ -4,15 +4,22 @@
 
 Portions of these files are adapted from MCP for Blender
 (<https://github.com/ahujasid/mcp-for-blender>, commit
-`25e1fe008fc523b1a947c6f3d28510a362a0f06e`, 2026-10-18):
+`25e1fe008fc523b1a947c6f3d28510a362a0f06e`, 2026-10-18), Copyright (c) 2025 Siddharth Ahuja,
+MIT License:
 
-- `scripts/look.py`, `scripts/look_blender.py` (the "look" tool: views, framing, shading)
-- `scripts/assets.py`, `scripts/assets_blender.py` (Poly Haven, Poly Pizza and Sketchfab search,
-  download and import)
+- `scripts/look.py`, `scripts/look_blender.py`: the look tool's modes and shading names, drawing the
+  viewport offscreen with computed view and projection matrices, the table of view angles, the camera
+  matrix, saving and restoring settings, and the wireframe and X-ray recipes.
+- `scripts/assets.py`, `scripts/assets_blender.py`: the Poly Haven, Poly Pizza and Sketchfab API use
+  (endpoints, filters, ranking, error messages, the checked download, thumbnail addresses), the texture
+  map table and colour spaces, and real-world sizes from the asset record.
 
-Nothing of its telemetry, trajectory capture, consent prompts or premium hints was taken.
-The rest of this skill is GPL-3.0-or-later; MIT-licensed code may be combined with it, and
-its notice follows in full.
+Each of these four files says so in its first lines. No other file in this skill holds their code; the
+tests and their fixtures were written for this skill. Nothing of its telemetry, trajectory capture,
+consent prompts or premium hints was taken.
+
+The rest of this skill is GPL-3.0-or-later; MIT-licensed code may be combined with it. The notice
+follows in full, as it stands in `LICENSE` at that commit.
 
 ```
 MIT License

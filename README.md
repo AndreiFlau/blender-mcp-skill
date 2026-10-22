@@ -27,6 +27,12 @@ git clone https://github.com/AndreiFlau/blender-mcp-skill "%USERPROFILE%\.claude
   repository, not extensions.blender.org) enabled, plus
   **Allow Online Access** in Preferences → System.
 - The extension auto-starts its bridge server on `localhost:9876`.
+- The scripts need Python 3.10 or later and nothing else: standard library only, nothing to
+  install. The parts that run inside Blender use bpy and numpy, which ship with Blender.
+- look.py's headless pictures are Blender's own viewport drawing from Blender 5.2 on; older
+  versions get renders instead.
+- assets.py: Poly Haven needs no key; Poly Pizza needs `POLYPIZZA_API_KEY` and Sketchfab
+  `SKETCHFAB_API_TOKEN`.
 
 ## What's inside
 
@@ -42,11 +48,15 @@ git clone https://github.com/AndreiFlau/blender-mcp-skill "%USERPROFILE%\.claude
   python scripts/bmcp.py -t 600 -f render_job.py
   ```
 
-- `scripts/look.py` (+ `look_blender.py`) — the scene as pictures: angles,
-  camera, frames, viewport, an add-on's UI; any shading; headless or live.
-- `scripts/assets.py` (+ `assets_blender.py`) — search, fetch and import Poly Haven,
-  Poly Pizza and Sketchfab assets, or a local model file, at the right size.
-- `tests/` — the two tools' self-tests (headless, bridge, and windowed checks).
+- `scripts/look.py` — the scene as pictures (angles, camera, frames, viewport, image, an add-on's UI), live or headless.
+- `scripts/look_blender.py` — the part of look.py that runs inside Blender.
+- `scripts/assets.py` — search, fetch and import Poly Haven, Poly Pizza, Sketchfab or local assets at real size, with credits.
+- `scripts/assets_blender.py` — the part of assets.py that runs inside Blender.
+- `references/look-and-assets.md` — how to use both tools: every option, the safety checks, failures, tests.
+- `tests/test_look.py` — look.py's self-tests, headless and through a bridge on a spare port.
+- `tests/look_gui_check.py` — look.py's check in a windowed Blender (viewport, ui, deferred ticks).
+- `tests/test_assets.py` — assets.py's self-tests: a fixture server, real Poly Haven, a bridge, windowed rows.
+- `tests/fixtures/assets/` — recorded API answers and tiny files for those tests, rebuilt by `make_fixtures.py`.
 - `THIRD_PARTY_NOTICES.md` — portions adapted from MCP for Blender (MIT).
 
 ## License

@@ -25,12 +25,18 @@ WORK_DIR/gui_rows.json and quits (exit code 0 when every row passed).
 
 What the lead should SEE while it runs: the window flickers for the ui cases (the sidebar opens on the
 "Item" tab, the Properties editor shows Green's material, the Preferences list shows the Cycles add-on),
-and everything is back as it was after each case. Look at the pictures listed at the end:
+and everything is back as it was after each case. Near the end the 3D view goes into local view with only
+the red cube (G11) and comes out again. Look at the pictures listed at the end:
   viewport.png      the window's 3D view as it is (front, red cube in the middle), no UI chrome
   sidebar.png       the 3D view's sidebar, Item tab, at its real width
   properties.png    the Material tab of Green
   preferences.png   the add-ons list filtered to Cycles, expanded
   window.png        the whole window
+  localview.png     the green sphere from the front and the right, although the 3D view was in local view
+                    with only the red cube (G11)
+The rows G11-G13 check, in a window, what the mender fixed headless: local view (G11), --isolate with a
+selection (G12, the selection is in the independent state dump), and the session's frame-change handler
+paused during a deferred frames look (G13).
 """
 import sys
 sys.dont_write_bytecode = True     # no __pycache__ beside the skill's files
@@ -93,6 +99,7 @@ def prepare():
     server.start("127.0.0.1", PORT)
     bpy.app.timers.register(interactive.run, first_interval=0.1)
     STATE["server"] = server
+    STATE["deferred"] = importlib.import_module(PACKAGE.name + ".deferred_tool")
     print("GUI| serving the bridge on", PORT, "pid", os.getpid(), flush=True)
 
 
@@ -217,6 +224,75 @@ def check_render_result(rc, res):
         error=res.get("error"))
 
 
+def _local_view_toggle(only=None):
+    """Enter (select `only` first) or leave local view in the window's largest 3D view."""
+    window, area = view3d()
+    region = next(r for r in area.regions if r.type == "WINDOW")
+    layer = window.view_layer
+    keep = [o.name for o in layer.objects if o.select_get()]
+    for o in layer.objects:
+        o.select_set(o.name == only)
+    with bpy.context.temp_override(window=window, area=area, region=region):
+        bpy.ops.view3d.localview(frame_selected=False)
+    for o in layer.objects:
+        o.select_set(o.name in keep)
+    layer.update()
+
+
+def _local_objects():
+    window, area = view3d()
+    window.view_layer.update()
+    return sorted(o.name for o in window.view_layer.objects if o.local_view_get(area.spaces.active))
+
+
+def prepare_special(special):
+    if special == "localview":
+        _local_view_toggle("Red")
+        STATE["local"] = _local_objects()
+    elif special == "select":
+        for name in ("Green", "Blue"):
+            bpy.data.objects[name].select_set(True)
+    elif special == "handler":
+        STATE["seen"] = 0
+
+        def look_gui_recorder(scene, depsgraph=None):
+            STATE["seen"] += 1
+        STATE["handler"] = look_gui_recorder
+        bpy.app.handlers.frame_change_post.append(look_gui_recorder)
+
+
+def cleanup_special(special):
+    if special in ("localview", "localview_viewport"):
+        _local_view_toggle()
+    elif special == "select":
+        for ob in bpy.context.view_layer.objects:
+            ob.select_set(False)
+    elif special == "handler":
+        bpy.app.handlers.frame_change_post.remove(STATE["handler"])
+
+
+def check_localview(rc, res):
+    tile = (res.get("tiles") or [{}])[0]
+    green = tl.mask_stats(tl.read_png(tile["path"]), ["green"]).get("count", 0) if tile.get("path") else 0
+    after = _local_objects()
+    row("G11 local view (only Red in it): angles of Green draw Green; the local view still holds only Red",
+        rc == 0 and green > 1000 and STATE.get("local") == ["Red"] and after == ["Red"] and
+        res.get("fingerprint", {}).get("equal"), green_pixels=green, local_view=[STATE.get("local"), after],
+        warnings=res.get("warnings"))
+
+
+def check_isolate_selected(rc, res):
+    row("G12 --isolate while Green and Blue are selected: ok (the independent dump below checks the selection)",
+        rc == 0 and res.get("fingerprint", {}).get("equal"), error=res.get("error"))
+
+
+def check_handler(rc, res):
+    still = STATE.get("handler") in bpy.app.handlers.frame_change_post
+    row("G13 frames look in a window: the session's frame-change handler did not run and is still registered",
+        rc == 0 and STATE.get("seen") == 0 and still, calls=STATE.get("seen"), still=still,
+        paused=res.get("handlers_paused"))
+
+
 CASES = [
     (["--mode", "viewport", "--out", out("viewport.png")], check_viewport, None),
     (["--mode", "viewport", "--shading", "wireframe", "--out", out("viewport_wire.png")], check_viewport_wire, None),
@@ -240,6 +316,12 @@ CASES = [
     (["--mode", "angles", "--expect-pid", str(os.getpid()), "--expect-file", "gui_control.blend",
       "--views", "front", "--out", out("right_pid.png")], check_ok("the right --expect-pid and --expect-file"), None),
     (["--mode", "image", "--image", "Render Result", "--out", out("render_result.png")], check_render_result, "render"),
+    (["--mode", "angles", "--target", "Green", "--views", "front,right", "--out", out("localview.png")],
+     check_localview, "localview"),
+    (["--mode", "angles", "--target", "Red", "--isolate", "--views", "front,right", "--out", out("isolate_sel.png")],
+     check_isolate_selected, "select"),
+    (["--mode", "frames", "--frames", "1,6,11,16,21", "--view", "front", "--target", "Mover", "--tick-budget", "0",
+      "--out", out("frames_handler.png")], check_handler, "handler"),
 ]
 
 
@@ -263,6 +345,7 @@ def _tick():
             render_now()
         if special == "prefs":
             STATE["section"], STATE["dirty"] = bpy.context.preferences.active_section, bpy.context.preferences.is_dirty
+        prepare_special(special)
         STATE["before"] = tl._state()
         STATE["planted"] = False
         STATE["stdout"] = open(WORK / ("gui_case_%02d.json" % case), "w", encoding="utf-8")
@@ -272,8 +355,10 @@ def _tick():
                                          stderr=STATE["stderr"], env=env)
         STATE["started"] = time.time()
         return 0.05
-    if special == "plant" and not STATE["planted"] and time.time() - STATE["started"] > 0.6:
-        bpy.data.objects["Green"].select_set(True)      # "the user" clicks while the job runs
+    # "The user" clicks while the job runs: once the bridge holds it as a deferred job, i.e. after its first tick and
+    # its first fingerprint (a click at a fixed time came before the job had started, so it was part of "before").
+    if special == "plant" and not STATE["planted"] and STATE["deferred"].has_pending():
+        bpy.data.objects["Green"].select_set(True)
         STATE["planted"] = True
     if proc.poll() is None:
         if time.time() - STATE["started"] > 300:
@@ -289,6 +374,7 @@ def _tick():
     drift = sorted(k for k in STATE["before"] if STATE["before"][k] != after.get(k))
     check(proc.returncode, result)
     row("   ... and the independent state dump is unchanged", not drift, changed=drift)
+    cleanup_special(special)
     STATE["proc"] = None
     STATE["case"] += 1
     return 0.2
@@ -308,5 +394,8 @@ def finish():
     return None
 
 
+# No start-up splash: it would sit over the 3D view's right side, inside the sidebar screenshot. This runs during
+# --python, before Blender decides to show it; the profile is the sandbox's, never saved.
+bpy.context.preferences.view.show_splash = False
 prepare()
 bpy.app.timers.register(tick, first_interval=2.0)

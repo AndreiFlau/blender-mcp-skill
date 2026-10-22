@@ -7,7 +7,8 @@ Everything here is made from nothing (no real asset is copied): 16 x 16 JPEGs, a
 exported as glTF and GLB, zips built from them (one sound, one with a '..' member, one with an absolute
 member), a MaterialX file, and JSON answers in the shapes the real APIs use (recorded from Poly Haven's and
 Sketchfab's public endpoints on 2026-10-19 and trimmed; Poly Pizza's from its API description). URLs inside
-the JSON carry the placeholder {BASE}, which the test server replaces with its own address.
+the JSON carry the placeholder {BASE}, which the test server replaces with its own address. Last, it runs
+make_attack_fixtures.py, which derives the attack rows' fixtures from these with the standard library alone.
 """
 import hashlib
 import json
@@ -273,4 +274,8 @@ save_json("sf_search_box.json", {"cursors": {"next": None, "previous": None}, "n
                                  "results": [sf(u, n) for u, (n, _l) in uids.items()][:2]})
 save_json("expected.json", {"box_bounds": {"min": lo, "max": hi, "size": [h - l for l, h in zip(lo, hi)]},
                             "box_objects": ["FxRoot", "Box", "Lid"], "gltf_files": gltf_files})
+# The attack rows' fixtures are derived from these with the standard library alone.
+import runpy  # noqa: E402
+sys.argv = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "make_attack_fixtures.py"), OUT]
+runpy.run_path(sys.argv[0], run_name="__main__")
 print("FIXTURES|", OUT, sorted(os.listdir(FILES)), sorted(os.listdir(API)))

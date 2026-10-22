@@ -1,0 +1,18 @@
+{
+ "hdri": {
+  "1k": {
+   "hdr": {
+    "md5": "c7e87ddf750032c532a57b3c711fb202",
+    "size": 109,
+    "url": "{BASE}/files/fx_sky_1k.hdr"
+   }
+  },
+  "24k": {
+   "exr": {
+    "md5": "c7e87ddf750032c532a57b3c711fb202",
+    "size": 2451000000,
+    "url": "{BASE}/files/fx_sky_1k.hdr"
+   }
+  }
+ }
+}
