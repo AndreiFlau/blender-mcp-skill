@@ -67,8 +67,10 @@ Null-byte-delimited JSON over TCP:
 - The code string runs via `exec()` in a **fresh namespace** — `import bpy` yourself
   (the bundled client prepends it for you).
 - To return structured data, assign a **dict** to a variable named `result`
-  (anything else errors). With `strict_json: false`, non-serializable values are
-  `repr()`-ed. `print()` output comes back in `"stdout"`.
+  (anything else errors: a list is refused with "The `result` variable must be a
+  dict, not list. Wrap your return value: `result = {"key": value}`"). With
+  `strict_json: false`, non-serializable values are `repr()`-ed. `print()` output
+  comes back in `"stdout"`.
 - Exceptions return `status: "error"` with the full traceback — read it, don't guess.
 - A weak sandbox blocks: `sys.exit()`, `bpy.ops.wm.quit_blender`,
   `bpy.ops.wm.read_factory_settings`, `read_factory_userpref`, `read_userpref`.
