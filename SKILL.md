@@ -77,6 +77,15 @@ Null-byte-delimited JSON over TCP:
 - Code runs from a **timer context**: some operators need a context override —
   `with bpy.context.temp_override(window=..., area=...)`. Find areas via
   `bpy.context.window_manager.windows[0].screen.areas`.
+- **`temp_override(active_object=X)` does not redirect `bpy.ops.object.mode_set`**
+  (Blender 5.3, live GUI, 2026-11-20). Asked to put an armature in Edit Mode, it
+  toggled the mesh the user had just clicked instead; the follow-up
+  `mode_set('OBJECT')` then saw the overridden armature already in Object Mode and
+  did nothing, leaving the user's mesh stuck in Edit Mode and `edit_bones` empty
+  (so the edit loop silently ran zero times). Make X the real active object:
+  save `view_layer.objects.active` and the selection, set `objects.active = X`,
+  `mode_set`, do the work, `mode_set('OBJECT')`, then restore both. Assert
+  `X.mode == 'EDIT'` and `len(X.data.edit_bones) > 0` before editing.
 - **Long jobs (renders)**: define a callable `check_is_finished` in your code that
   returns `None` while running and a response dict when done — the server holds the
   connection open (up to 1 h) and polls it on its timer. Keep the checker cheap
