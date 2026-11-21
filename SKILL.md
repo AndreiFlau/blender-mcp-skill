@@ -120,6 +120,23 @@ or make sure the change is undoable (`bpy.ops.ed.undo_push(message=...)` before
 mutating helps). **Never** save (`bpy.ops.wm.save_mainfile`) or open another file
 in the live session unless the user asked.
 
+**A "read-only" census can still hurt the session: reading `Image.size` loads the
+picture** (2026-11-21). A walk over `bpy.data.images` reading `size` (to total up
+texture memory) froze the user's Blender for 37 s and loaded all 2,146 pictures:
+7.3 GB became 19.2 GB, with 4.3 GB of RAM left free. `has_data` reads `True` for
+every picture afterwards, so it cannot tell you what was loaded before. The same
+goes for `pixels`, and for anything that evaluates every object (`evaluated_get`,
+`to_mesh`) on a big scene.
+- In the live session read only plain properties: names, counts, `users`,
+  `packed_file.size`, `filepath`, transforms. Time the snippet on a slice first
+  (`[:50]`) and scale it up in your head before running it over everything.
+- For picture sizes, do the census on a background copy of the saved file, and
+  call `image.buffers_free()` right after each `size` read so memory stays flat.
+- If it has already happened: `image.buffers_free()` on every picture with
+  `has_data`, skipping those with `is_dirty` (unsaved paint) and any whose
+  `source` is not `FILE`, `SEQUENCE` or `TILED`. Blender reloads them on demand;
+  the file is not marked changed. It took 1 s and brought memory back.
+
 ## If the server isn't running
 
 - Check: is anything listening? `Get-NetTCPConnection -LocalPort 9876 -State Listen`
