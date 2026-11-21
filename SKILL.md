@@ -125,8 +125,11 @@ picture** (2026-11-21). A walk over `bpy.data.images` reading `size` (to total u
 texture memory) froze the user's Blender for 37 s and loaded all 2,146 pictures:
 7.3 GB became 19.2 GB, with 4.3 GB of RAM left free. `has_data` reads `True` for
 every picture afterwards, so it cannot tell you what was loaded before. The same
-goes for `pixels`, and for anything that evaluates every object (`evaluated_get`,
-`to_mesh`) on a big scene.
+goes for `Image.file_format` (its getter loads the picture as well: a background
+audit went from 4.3 GB to 17.35 GB for 36 s on it), for `pixels`, and for anything
+that evaluates every object (`evaluated_get`, `to_mesh`) on a big scene. Sizes and
+formats read from the file headers or the packed bytes cost nothing (2,147
+pictures in 1.7 s).
 - In the live session read only plain properties: names, counts, `users`,
   `packed_file.size`, `filepath`, transforms. Time the snippet on a slice first
   (`[:50]`) and scale it up in your head before running it over everything.
