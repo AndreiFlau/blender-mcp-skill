@@ -120,6 +120,15 @@ or make sure the change is undoable (`bpy.ops.ed.undo_push(message=...)` before
 mutating helps). **Never** save (`bpy.ops.wm.save_mainfile`) or open another file
 in the live session unless the user asked.
 
+**A client that dies while printing the reply has still changed the session**
+(2026-11-24). `bmcp.py`, its output sent to a file, died with `UnicodeEncodeError:
+'charmap' codec can't encode characters` from `encodings\cp1252.py`, because the
+script's stdout held node names in Chinese. Blender had already run all of it: three
+bones, 40 properties and 90 drivers were in the open file. Running the script again
+"because it failed" would have been a second mutation. After any client-side error on
+a mutating call, ask the session what it holds before doing anything else. `bmcp.py`
+now sets its own output to UTF-8, so that particular death is gone.
+
 **A "read-only" census can still hurt the session: reading `Image.size` loads the
 picture** (2026-11-21). A walk over `bpy.data.images` reading `size` (to total up
 texture memory) froze the user's Blender for 37 s and loaded all 2,146 pictures:

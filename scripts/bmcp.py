@@ -69,6 +69,13 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("timeout must be a positive finite number")
+    # A reply can hold any text (node names in Chinese, accented paths). Sent to a file or a pipe, Windows gives
+    # stdout cp1252, and printing the reply then dies AFTER Blender has already run the code.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     if args.file:
         with open(args.file, encoding="utf-8") as f:
             code = f.read()
